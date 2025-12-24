@@ -1,0 +1,15 @@
+# Секреты
+.env
+
+# Сессии Telethon (очень важно, это доступ к аккаунту!)
+*.session
+*.session-journal
+
+# Базы данных и логи
+*.csv
+*.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
