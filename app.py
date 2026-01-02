@@ -1,413 +1,258 @@
 import asyncio
-import csv
 import os
 import sys
 import json
-import signal
 import io
-from datetime import datetime, timezone
-from dotenv import load_dotenv  # Добавлено
+import sqlite3
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
-from telethon.tl.types import User, Chat, Channel, MessageActionTopicCreate, MessageMediaPhoto, MessageMediaDocument
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+from telegram.ext import ApplicationBuilder
 
 # ====== ЗАГРУЗКА КОНФИГУРАЦИИ ======
-load_dotenv() # Загружает переменные из .env
+load_dotenv()
 
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-
-# Настройки чатов (с дефолтными значениями на всякий случай)
-TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID', -1003044057818))
-ALLOWED_CHAT_ID = int(os.getenv('ALLOWED_CHAT_ID', -1003044057818))
-
-# Обработка списка разрешенных источников
-allowed_sources_raw = os.getenv('ALLOWED_SOURCES', '')
-ALLOWED_SOURCES = [int(s.strip()) for s in allowed_sources_raw.split(',') if s.strip()]
+TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
+ALLOWED_SOURCES = [int(s.strip()) for s in os.getenv('ALLOWED_SOURCES', '').split(',') if s.strip()]
 ONLY_WHITELIST = os.getenv('ONLY_WHITELIST', 'False').lower() in ('true', '1', 't')
 
-# ====== ФАЙЛЫ (можно оставить так или тоже в .env) ======
-CHAT_CSV = 'chats_seen.csv'
-MESSAGES_CSV = 'messages_log.csv'
-SUBSCRIBERS_FILE = 'subscribers.json'
 TOPICS_DB_FILE = 'topics_mapping.json'
+DB_FILE = 'bot_data.db'
 
-# ====== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======
 client = None
-bot_app = None 
-seen_chats = set()
-running = True
+bot_app = None
+VALID_TOPICS = set() 
 
-# Исключения
-EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), TARGET_CHAT_ID, 777000]
-EXCLUDED_TOPICS = [1]
+# Список системных ID для блокировки
+SYSTEM_IDS = [777000, 1000, 1087968824] 
+EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), TARGET_CHAT_ID] + SYSTEM_IDS
 
-class TopicManager:
-    """Менеджер для работы с темами форума"""
-    
+# ====== DB MANAGER ======
+class DBManager:
     @staticmethod
-    def load_topics_db():
-        if not os.path.exists(TOPICS_DB_FILE):
-            return {}
+    def init_db():
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS message_map (
+                    source_id INTEGER PRIMARY KEY,
+                    target_msg_id INTEGER,
+                    topic_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+    @staticmethod
+    def save_relation(source_msg_id, target_msg_id, topic_id):
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO message_map (source_id, target_msg_id, topic_id) VALUES (?, ?, ?)',
+                (source_msg_id, target_msg_id, topic_id)
+            )
+
+    @staticmethod
+    def get_relation(source_id):
         try:
-            with open(TOPICS_DB_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
+            with sqlite3.connect(DB_FILE) as conn:
+                r = conn.execute(
+                    'SELECT target_msg_id, topic_id FROM message_map WHERE source_id = ?',
+                    (source_id,)
+                ).fetchone()
+                return {"target_msg_id": r[0], "topic_id": r[1]} if r else None
+        except sqlite3.OperationalError:
+            return None
 
     @staticmethod
-    def save_topics_db(db):
+    def cleanup_old_records():
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("DELETE FROM message_map WHERE created_at < datetime('now', '-48 hours')")
+
+# ====== TOPIC MANAGER ======
+class TopicManager:
+    @staticmethod
+    def load_db():
+        if not os.path.exists(TOPICS_DB_FILE): return {}
+        try:
+            with open(TOPICS_DB_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+        except: return {}
+
+    @staticmethod
+    def save(chat_id, source_thread_id, chat_title, dest_topic_id):
+        db = TopicManager.load_db()
+        key = f"{chat_id}_{source_thread_id or 0}"
+        db[key] = {
+            "chat_title": chat_title,
+            "topic_id": int(dest_topic_id),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
         with open(TOPICS_DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(db, f, indent=2, ensure_ascii=False)
 
     @staticmethod
-    def _get_db_key(chat_id, source_thread_id):
-        """Создает уникальный ключ: CHATID_THREADID"""
-        t_id = source_thread_id if source_thread_id else 0
-        return f"{chat_id}_{t_id}"
+    def get_topic_id(chat_id, source_thread_id):
+        return TopicManager.load_db().get(f"{chat_id}_{source_thread_id or 0}", {}).get("topic_id")
 
     @staticmethod
-    def get_topic_id_for_source(chat_id, source_thread_id):
-        db = TopicManager.load_topics_db()
-        key = TopicManager._get_db_key(chat_id, source_thread_id)
-        return db.get(key, {}).get('topic_id')
+    def remove(chat_id, source_thread_id):
+        db = TopicManager.load_db()
+        db.pop(f"{chat_id}_{source_thread_id or 0}", None)
+        with open(TOPICS_DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(db, f, indent=2, ensure_ascii=False)
+        VALID_TOPICS.discard((chat_id, source_thread_id))
 
-    @staticmethod
-    def save_topic_for_source(chat_id, source_thread_id, chat_title, dest_topic_id):
-        db = TopicManager.load_topics_db()
-        key = TopicManager._get_db_key(chat_id, source_thread_id)
-        db[key] = {
-            'chat_title': chat_title,
-            'source_thread_id': source_thread_id,
-            'topic_id': dest_topic_id,
-            'created_at': datetime.now(timezone.utc).isoformat()
-        }
-        TopicManager.save_topics_db(db)
-
-    @staticmethod
-    def remove_topic_mapping(chat_id, source_thread_id):
-        db = TopicManager.load_topics_db()
-        key = TopicManager._get_db_key(chat_id, source_thread_id)
-        if key in db:
-            del db[key]
-            TopicManager.save_topics_db(db)
-
-class CSVManager:
-    """Менеджер для работы с CSV файлами"""
-    @staticmethod
-    def ensure_csv():
-        if os.path.exists(CHAT_CSV):
-            with open(CHAT_CSV, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                next(reader, None)
-                for row in reader:
-                    if row:
-                        try: seen_chats.add(int(row[0]))
-                        except ValueError: pass
-        if not os.path.exists(CHAT_CSV):
-            with open(CHAT_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['chat_id', 'chat_type', 'chat_title', 'chat_username', 'first_seen_utc'])
-        if not os.path.exists(MESSAGES_CSV):
-            with open(MESSAGES_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timestamp_utc', 'chat_id', 'chat_title', 'sender_id', 'sender_username', 'message_id', 'has_media', 'text_truncated'])
-
-    @staticmethod
-    def log_message_row(row: list):
-        with open(MESSAGES_CSV, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-
-    @staticmethod
-    async def register_chat(chat):
-        try:
-            chat_id = getattr(chat, 'id', None)
-            if chat_id is None or chat_id in seen_chats: return
-            seen_chats.add(chat_id)
-            if isinstance(chat, User): ctype, title, username = 'User', chat.first_name, chat.username or ''
-            elif isinstance(chat, (Chat, Channel)): ctype, title, username = type(chat).__name__, chat.title, chat.username or ''
-            else: ctype, title, username = 'Unknown', 'N/A', ''
-            with open(CHAT_CSV, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow([chat_id, ctype, title, username, datetime.now(timezone.utc).isoformat()])
-        except Exception: pass
-
+# ====== FORUM MANAGER ======
 class ForumManager:
-    """Менеджер для работы с форумом"""
-    
     @staticmethod
-    async def topic_exists(topic_id):
-        if topic_id in EXCLUDED_TOPICS: return False
+    async def _validate_topic(topic_id, chat_id, source_thread_id):
         try:
-            await bot_app.bot.edit_forum_topic(
+            msg = await bot_app.bot.send_message(
                 chat_id=TARGET_CHAT_ID,
-                message_thread_id=topic_id
+                text=".", 
+                message_thread_id=int(topic_id),
+                disable_notification=True
             )
+            await bot_app.bot.delete_message(TARGET_CHAT_ID, msg.message_id)
+            VALID_TOPICS.add((chat_id, source_thread_id))
             return True
         except Exception as e:
-            if any(x in str(e).lower() for x in ["not found", "bad request"]): return False
+            err = str(e).lower()
+            if any(x in err for x in ["topic", "thread", "not found", "invalid"]):
+                TopicManager.remove(chat_id, source_thread_id)
+                return False
             return True
 
     @staticmethod
-    async def create_topic(chat_id, chat_title, source_thread_name=None, source_thread_id=None):
-        try:
-            if not bot_app or not bot_app.running: return None
-            
-            base_name = chat_title
-            
-            # === ЛОГИКА ИМЕНОВАНИЯ: Сначала Топик, потом Канал ===
-            if source_thread_name:
-                topic_name = f"{source_thread_name} | {base_name}"
-            elif source_thread_id:
-                topic_name = f"Topic {source_thread_id} | {base_name}"
-            else:
-                topic_name = f"💬 {base_name}"
+    async def get_or_create_topic(chat_id, chat_title, source_thread_id, source_thread_name):
+        topic_id = TopicManager.get_topic_id(chat_id, source_thread_id)
+        if topic_id and (chat_id, source_thread_id) in VALID_TOPICS:
+            return int(topic_id)
 
-            # Обрезка имени (макс 128 символов)
-            topic_name = topic_name[:120] + "..." if len(topic_name) > 123 else topic_name
-            
-            print(f"🆕 Создаем тему: {topic_name}")
-            
-            result = await bot_app.bot.create_forum_topic(
-                chat_id=TARGET_CHAT_ID,
-                name=topic_name,
-                icon_color=0x6FB9F0,
-            )
-            
-            topic_id = result.message_thread_id
-            
-            # Приветственное сообщение (можно скрыть, если нужно совсем чисто)
-            welcome_text = (
-                f"📢 **{topic_name}**\n"
-                f"ID чата: `{chat_id}`"
-            )
-            await bot_app.bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                message_thread_id=topic_id,
-                text=welcome_text,
-                parse_mode='Markdown'
-            )
-            
-            TopicManager.save_topic_for_source(chat_id, source_thread_id, chat_title, topic_id)
-            return topic_id
-            
-        except Exception as e:
-            print(f"❌ Ошибка создания темы: {e}")
-            return None
+        if topic_id:
+            if await ForumManager._validate_topic(topic_id, chat_id, source_thread_id):
+                return int(topic_id)
+            topic_id = None
+
+        name = (f"{source_thread_name} | {chat_title}" if source_thread_name else f"💬 {chat_title}")[:120]
+        result = await bot_app.bot.create_forum_topic(chat_id=TARGET_CHAT_ID, name=name)
+        new_tid = int(result.message_thread_id)
+        TopicManager.save(chat_id, source_thread_id, chat_title, new_tid)
+        VALID_TOPICS.add((chat_id, source_thread_id))
+        return new_tid
 
     @staticmethod
-    async def get_or_create_topic(chat_id, chat_title, source_thread_id=None, source_thread_name=None):
-        existing_dest_topic = TopicManager.get_topic_id_for_source(chat_id, source_thread_id)
-        
-        if existing_dest_topic:
-            if await ForumManager.topic_exists(existing_dest_topic):
-                return existing_dest_topic
-            else:
-                TopicManager.remove_topic_mapping(chat_id, source_thread_id)
-        
-        return await ForumManager.create_topic(chat_id, chat_title, source_thread_name, source_thread_id)
+    async def send_to_topic(msg, chat_id, chat_title, source_thread_id, source_thread_name):
+        text = msg.message or ""
+        for attempt in (1, 2):
+            tid = await ForumManager.get_or_create_topic(chat_id, chat_title, source_thread_id, source_thread_name)
+            if not tid or tid <= 1: return
 
-    @staticmethod
-    async def send_to_topic(telethon_message, chat_id, chat_title, source_thread_id=None, source_thread_name=None):
-        try:
-            if not bot_app or not bot_app.running: return
-
-            final_topic_id = await ForumManager.get_or_create_topic(chat_id, chat_title, source_thread_id, source_thread_name)
-            
-            if not final_topic_id:
-                print("❌ Не удалось определить тему назначения")
-                return
-
-            text_content = telethon_message.message or ""
-
-            # === ОТПРАВКА МЕДИА ===
-            if telethon_message.media:
-                print(f"📥 Скачиваем медиа...")
-                media_buffer = io.BytesIO()
-                await telethon_message.download_media(file=media_buffer)
-                media_buffer.seek(0)
-                
-                try:
-                    if isinstance(telethon_message.media, MessageMediaPhoto):
-                        await bot_app.bot.send_photo(
-                            chat_id=TARGET_CHAT_ID,
-                            message_thread_id=final_topic_id,
-                            photo=media_buffer,
-                            caption=text_content,
-                            parse_mode=None
-                        )
-                    elif isinstance(telethon_message.media, MessageMediaDocument):
-                        mime_type = telethon_message.media.document.mime_type
-                        if 'video' in mime_type:
-                             await bot_app.bot.send_video(
-                                chat_id=TARGET_CHAT_ID,
-                                message_thread_id=final_topic_id,
-                                video=media_buffer,
-                                caption=text_content,
-                                parse_mode=None
-                            )
-                        elif 'audio' in mime_type or 'voice' in mime_type:
-                             await bot_app.bot.send_audio(
-                                chat_id=TARGET_CHAT_ID,
-                                message_thread_id=final_topic_id,
-                                audio=media_buffer,
-                                caption=text_content,
-                                parse_mode=None
-                            )
-                        else:
-                            await bot_app.bot.send_document(
-                                chat_id=TARGET_CHAT_ID,
-                                message_thread_id=final_topic_id,
-                                document=media_buffer,
-                                caption=text_content,
-                                parse_mode=None
-                            )
+            try:
+                params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": tid}
+                if msg.media:
+                    buf = io.BytesIO()
+                    await msg.download_media(file=buf)
+                    buf.seek(0)
+                    if isinstance(msg.media, MessageMediaPhoto):
+                        sent = await bot_app.bot.send_photo(photo=buf, caption=text, **params)
                     else:
-                        if text_content:
-                            await bot_app.bot.send_message(
-                                chat_id=TARGET_CHAT_ID,
-                                message_thread_id=final_topic_id,
-                                text=text_content + "\n[Неподдерживаемый тип медиа]"
-                            )
-                except Exception as media_err:
-                    print(f"⚠️ Ошибка отправки медиа: {media_err}. Пробуем отправить текст.")
-                    if text_content:
-                         await bot_app.bot.send_message(
-                            chat_id=TARGET_CHAT_ID,
-                            message_thread_id=final_topic_id,
-                            text=text_content + "\n[Ошибка загрузки медиа]"
-                        )
-            
-            # === ТОЛЬКО ТЕКСТ ===
-            elif text_content:
-                await bot_app.bot.send_message(
-                    chat_id=TARGET_CHAT_ID,
-                    message_thread_id=final_topic_id,
-                    text=text_content,
-                    parse_mode=None
-                )
-            
-            print(f"✅ Переслано в тему {final_topic_id}")
-            
-        except Exception as e:
-            print(f"❌ Ошибка отправки в тему: {e}")
+                        sent = await bot_app.bot.send_document(document=buf, caption=text, **params)
+                else:
+                    sent = await bot_app.bot.send_message(text=text, **params)
 
-# ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
+                if sent.message_thread_id != tid:
+                    await bot_app.bot.delete_message(TARGET_CHAT_ID, sent.message_id)
+                    raise RuntimeError("GENERAL_FALLBACK")
 
-async def get_source_thread_info(client, message):
-    thread_id = None
-    thread_name = None
-
-    if message.reply_to and message.reply_to.forum_topic:
-        thread_id = message.reply_to.reply_to_msg_id
-        try:
-            top_messages = await client.get_messages(message.peer_id, ids=[thread_id])
-            if top_messages:
-                top_msg = top_messages[0]
-                if top_msg and top_msg.action and isinstance(top_msg.action, MessageActionTopicCreate):
-                    thread_name = top_msg.action.title
-                elif top_msg and top_msg.message:
-                    thread_name = top_msg.message[:30]
-        except Exception: pass
-    
-    return thread_id, thread_name
-
-# ====== ОБРАБОТЧИКИ ======
-
-async def all_message_handler(event):
-    try:
-        msg = event.message
-        if not msg.message and not msg.media: return
-
-        chat = await event.get_chat()
-        chat_id = getattr(chat, 'id', None)
-
-        # ====== ЛОГИКА ФИЛЬТРАЦИИ ИСТОЧНИКОВ ======
-        if ONLY_WHITELIST:
-            # Проверяем, есть ли ID текущего чата в списке разрешенных
-            if chat_id not in ALLOWED_SOURCES:
-                # Если это не наш канал, просто игнорируем сообщение
+                DBManager.save_relation(msg.id, sent.message_id, tid)
                 return
-        # ==========================================
+            except Exception as e:
+                if attempt == 1 and any(x in str(e).lower() for x in ["topic", "thread", "invalid"]):
+                    TopicManager.remove(chat_id, source_thread_id)
+                    continue
+                print(f"❌ Ошибка отправки: {e}")
+                return
 
-        sender = await event.get_sender()
-        await CSVManager.register_chat(chat)
+# ====== HANDLERS ======
+async def msg_handler(event):
+    msg = event.message
+    
+    # Жесткая блокировка системных сообщений (action не None означает системное сообщение)
+    if not msg.sender_id or msg.sender_id in SYSTEM_IDS or msg.action is not None:
+        return
 
-        chat_title = getattr(chat, 'title', '') or getattr(chat, 'first_name', '') or 'Private Chat'
-        sender_id = getattr(sender, 'id', 'N/A')
+    chat = await event.get_chat()
+    chat_id = getattr(chat, 'id', None)
+    if ONLY_WHITELIST and chat_id not in ALLOWED_SOURCES: return
+    
+    sender = await event.get_sender()
+    sender_id = getattr(sender, 'id', 0)
+    if sender_id in EXCLUDED_SENDERS: return
+
+    title = getattr(chat, 'title', '') or getattr(chat, 'first_name', 'Private')
+    source_tid, source_tname = None, None
+    if msg.reply_to and msg.reply_to.forum_topic:
+        source_tid = msg.reply_to.reply_to_msg_id
+        try:
+            m = await event.client.get_messages(msg.peer_id, ids=[source_tid])
+            if m and m[0].action: source_tname = m[0].action.title
+        except: pass
+    await ForumManager.send_to_topic(msg, chat_id, title, source_tid, source_tname)
+
+async def edit_handler(event):
+    msg = event.message
+    if not msg.sender_id or msg.sender_id in SYSTEM_IDS or msg.action is not None:
+        return
+    
+    relation = DBManager.get_relation(msg.id)
+    if not relation: return
+    
+    try:
+        # МСК время (UTC+3)
+        now = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
+        new_text = (msg.text or "") + f"\n\n(ред. {now})"
         
-        if sender_id in EXCLUDED_SENDERS: return
-
-        source_thread_id, source_thread_name = await get_source_thread_info(event.client, msg)
-
-        print(f"🎯 Входящее (РАЗРЕШЕНО) от {chat_title}: {msg.message[:20]}...")
-
-        await ForumManager.send_to_topic(
-            msg, chat_id, chat_title, source_thread_id, source_thread_name
-        )
-        
+        if msg.media:
+            await bot_app.bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=relation["target_msg_id"], caption=new_text)
+        else:
+            await bot_app.bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=relation["target_msg_id"], text=new_text)
     except Exception as e:
-        print(f'Handler exception: {e}')
-        
-        
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ALLOWED_CHAT_ID: return
-    await update.message.reply_text("✅ Бот активен")
-
-async def restrict_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
-        await update.message.reply_text("❌ Только для ShakerupParser.")
-
-# ====== STARTUP ======
-
-async def start_telethon():
-    global client
-    client = TelegramClient('support_session', API_ID, API_HASH)
-    client.add_event_handler(all_message_handler, events.NewMessage(incoming=True))
-    await client.start()
-    print("👤 Telethon запущен")
-    return client
-
-async def start_bot():
-    global bot_app
-    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start_command))
-    bot_app.add_handler(MessageHandler(filters.ALL & ~filters.Chat(chat_id=ALLOWED_CHAT_ID), restrict_all_messages))
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling()
-    return bot_app
-
-async def shutdown():
-    global running, bot_app, client
-    running = False
-    if bot_app: await bot_app.updater.stop(); await bot_app.stop(); await bot_app.shutdown()
-    if client: await client.disconnect()
-
-def signal_handler(signum, frame):
-    asyncio.create_task(shutdown())
+        if "Message is not modified" not in str(e):
+            print(f"❌ Ошибка правки: {e}")
 
 async def main():
-    global bot_app, client
-    CSVManager.ensure_csv()
-    signal.signal(signal.SIGINT, signal_handler)
+    global client, bot_app
+    DBManager.init_db()
     
+    bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    await bot_app.initialize()
+    await bot_app.start()
+
+    client = TelegramClient('support_session', API_ID, API_HASH)
+    client.add_event_handler(msg_handler, events.NewMessage(incoming=True))
+    client.add_event_handler(edit_handler, events.MessageEdited())
+    await client.start()
+
+    print("🚀 Бот запущен. General ЗАБЛОКИРОВАН.")
     try:
-        await start_bot()
-        client = await start_telethon()
-        print("🚀 Система работает. Имена: 'Топик | Канал'. Без лишнего текста.")
-        while running:
-            await asyncio.sleep(1)
-    except Exception as e:
-        print(f"Error: {e}")
+        while True:
+            await asyncio.sleep(3600)
+            DBManager.cleanup_old_records()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
     finally:
-        await shutdown()
+        await client.disconnect()
+        if bot_app:
+            await bot_app.stop()
+            await bot_app.shutdown()
 
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
