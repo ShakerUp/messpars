@@ -146,12 +146,17 @@ class ForumManager:
     @staticmethod
     async def send_to_topic(msg, chat_id, chat_title, source_thread_id, source_thread_name):
         text = msg.message or ""
+        
         for attempt in (1, 2):
             tid = await ForumManager.get_or_create_topic(chat_id, chat_title, source_thread_id, source_thread_name)
-            if not tid or tid <= 1: return
+            
+            if not tid or tid <= 1:
+                print(f"🚫 [BLOCK] Пропуск для {chat_title}")
+                return
 
             try:
-                params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": tid}
+                params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": int(tid)}
+                
                 if msg.media:
                     buf = io.BytesIO()
                     await msg.download_media(file=buf)
@@ -163,12 +168,21 @@ class ForumManager:
                 else:
                     sent = await bot_app.bot.send_message(text=text, **params)
 
+                # --- ПРОВЕРКА НА FALLBACK ---
                 if sent.message_thread_id != tid:
+                    print(f"⚠️ Топик {tid} не принят сервером (упало в General). Пересоздаю...")
                     await bot_app.bot.delete_message(TARGET_CHAT_ID, sent.message_id)
-                    raise RuntimeError("GENERAL_FALLBACK")
+                    
+                    # Удаляем только эту битую связь из JSON
+                    TopicManager.remove(chat_id, source_thread_id)
+                    
+                    if attempt == 1:
+                        continue # Пробуем еще раз (теперь создастся новый топик)
+                    return
 
                 DBManager.save_relation(msg.id, sent.message_id, tid)
                 return
+
             except Exception as e:
                 if attempt == 1 and any(x in str(e).lower() for x in ["topic", "thread", "invalid"]):
                     TopicManager.remove(chat_id, source_thread_id)
