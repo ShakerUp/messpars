@@ -4,6 +4,7 @@ import sys
 import json
 import io
 import sqlite3
+import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
@@ -14,6 +15,22 @@ from telethon.tl.types import (
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+
+# ====== НАСТРОЙКА ЛОГИРОВАНИЯ (ТОЛЬКО ДАННЫЕ) ======
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(message)s',
+    handlers=[
+        logging.FileHandler("bot_messages.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Полностью глушим системные логи библиотек
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("telegram").setLevel(logging.CRITICAL)
+logging.getLogger("telethon").setLevel(logging.CRITICAL)
 
 # ====== КОНФИГУРАЦИЯ ======
 load_dotenv()
@@ -26,8 +43,6 @@ ADMIN_ID = 684460638
 
 TOPICS_DB_FILE = 'topics_mapping.json'
 DB_FILE = 'bot_data.db'
-
-# Лимит на размер файла (50 МБ), чтобы защитить оперативную память сервера
 MAX_FILE_SIZE = 50 * 1024 * 1024 
 
 client = None
@@ -35,9 +50,8 @@ bot_app = None
 
 SYSTEM_IDS = [777000, 1000, 1087968824]
 EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), TARGET_CHAT_ID] + SYSTEM_IDS
-EXCLUDED_TOPICS = [1]
 
-# ====== DATABASE (LOG EDITS) ======
+# ====== DATABASE ======
 class DB:
     @staticmethod
     def init():
@@ -77,22 +91,18 @@ class TopicManager:
         chat_data = db.get(str(chat_id))
         if not chat_data: return "new"
         if not chat_data.get('enabled', True): return "paused"
-        
         t_key = str(s_tid or 0)
         topic_data = chat_data.get('topics', {}).get(t_key)
         if topic_data and not topic_data.get('enabled', True): return "paused"
-        
         return "active" if (topic_data and topic_data.get('topic_id')) else "active_need_topic"
 
     @staticmethod
     def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
         db = TopicManager.load_db()
         c_key, t_key = str(chat_id), str(s_tid or 0)
-        
         if c_key not in db:
             default_enabled = False if chat_type == "private" else True
             db[c_key] = {"title": title, "type": chat_type, "enabled": default_enabled, "topics": {}}
-        
         existing_topic = db[c_key]["topics"].get(t_key, {})
         db[c_key]["topics"][t_key] = {
             "topic_id": target_tid or existing_topic.get('topic_id'),
@@ -101,82 +111,46 @@ class TopicManager:
         }
         TopicManager.save_db(db)
 
-# ====== ПАНЕЛЬ УПРАВЛЕНИЯ (UI) ======
+# ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 async def show_manage_menu(query, cid, db):
     cdata = db.get(str(cid))
-    if not cdata:
-        await query.edit_message_text("Ошибка: данные не найдены.")
-        return
-    
+    if not cdata: return
     is_private = cdata.get('type') == 'private'
-    text = (
-        f"⚙️ **Управление:** {cdata['title']}\n"
-        f"ID: `{cid}`\n\n"
-        f"Статус чата: {'✅ ВКЛЮЧЕН' if cdata['enabled'] else '⏸ ПАУЗА'}"
-    )
-    
+    text = f"⚙️ **Управление:** {cdata['title']}\nID: `{cid}`\n\nСтатус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}"
     keyboard = [[InlineKeyboardButton(f"{'🔴 ВЫКЛЮЧИТЬ ЧАТ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ ЧАТ'}", callback_data=f"tgc_{cid}")]]
-    
     if not is_private:
         keyboard.append([InlineKeyboardButton("--- Ветки чата ---", callback_data="none")])
         for tid, tdata in cdata['topics'].items():
             t_status = "🟢" if tdata['enabled'] else "🔴"
             keyboard.append([InlineKeyboardButton(f"{t_status} {tdata['title']}", callback_data=f"tgt_{cid}_{tid}")])
-    
     back_target = "list_privates" if is_private else "list_groups"
     keyboard.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_target)])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    keyboard = [
-        [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
-        [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]
-    ]
-    text = "📂 **Главное меню:**\nВыберите категорию источников:"
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")], [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]]
+    text = "📂 **Главное меню:**"
+    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID or query.data == "none":
-        await query.answer(); return
-    
-    await query.answer()
-    db = TopicManager.load_db()
-    data = query.data
-
+    if query.from_user.id != ADMIN_ID or query.data == "none": await query.answer(); return
+    await query.answer(); db = TopicManager.load_db(); data = query.data
     if data in ["list_groups", "list_privates"]:
-        target_is_private = (data == "list_privates")
-        keyboard = []
-        for cid, d in db.items():
-            is_private = (d.get('type') == 'private')
-            if is_private == target_is_private:
-                status = "✅" if d['enabled'] else "⏸"
-                keyboard.append([InlineKeyboardButton(f"{status} {d['title']}", callback_data=f"manage_{cid}")])
-        keyboard.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu")])
-        await query.edit_message_text(f"📂 **Список: {'Лички' if target_is_private else 'Группы'}**", 
-                                    reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
-    elif data.startswith("manage_"):
-        await show_manage_menu(query, data.split("_")[1], db)
-
+        target_priv = (data == "list_privates")
+        kb = [[InlineKeyboardButton(f"{'✅' if d['enabled'] else '⏸'} {d['title']}", callback_data=f"manage_{cid}")] for cid, d in db.items() if (d.get('type') == 'private') == target_priv]
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+        await query.edit_message_text(f"📂 **Список: {'Лички' if target_priv else 'Группы'}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+    elif data.startswith("manage_"): await show_manage_menu(query, data.split("_")[1], db)
     elif data.startswith("tgc_"):
-        cid = data.split("_")[1]
-        db[cid]['enabled'] = not db[cid]['enabled']
-        TopicManager.save_db(db)
+        cid = data.split("_")[1]; db[cid]['enabled'] = not db[cid]['enabled']; TopicManager.save_db(db)
         await show_manage_menu(query, cid, db)
-
     elif data.startswith("tgt_"):
-        _, cid, tid = data.split("_")
-        db[cid]['topics'][tid]['enabled'] = not db[cid]['topics'][tid]['enabled']
-        TopicManager.save_db(db)
+        _, cid, tid = data.split("_"); db[cid]['topics'][tid]['enabled'] = not db[cid]['topics'][tid]['enabled']; TopicManager.save_db(db)
         await show_manage_menu(query, cid, db)
-
-    elif data == "main_menu":
-        await cmd_list(update, context)
+    elif data == "main_menu": await cmd_list(update, context)
 
 # ====== FORUM MANAGER ======
 class ForumManager:
@@ -196,8 +170,8 @@ class ForumManager:
             tid = res.message_thread_id
             await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, message_thread_id=tid, text=f"📢 {name}\nID: {chat_id}")
             return tid
-        except Exception as e:
-            print(f"❌ Ошибка создания темы: {e}"); return None
+        except Exception as e: 
+            return None
 
 # ====== ОБРАБОТЧИК СООБЩЕНИЙ ======
 async def telethon_handler(event):
@@ -205,16 +179,21 @@ async def telethon_handler(event):
     if msg.sender_id in EXCLUDED_SENDERS: return
     chat = await event.get_chat()
     
+    # 1. ЛОГИРУЕМ ПОЛУЧЕНИЕ (RAW DATA)
+    chat_title = getattr(chat, 'title', getattr(chat, 'first_name', 'Unknown'))
+    s_tid = 0
+    if msg.reply_to:
+        s_tid = msg.reply_to.reply_to_msg_id or 0
+
+    logger.info(f"[INCOMING] Chat: {chat_title} ({chat.id}) | Message ID: {msg.id} | Raw Data: {msg.to_dict()}")
+
     is_private = isinstance(chat, User)
     chat_type = "private" if is_private else ("channel" if getattr(chat, 'broadcast', False) else "group")
-    title = getattr(chat, 'title', getattr(chat, 'first_name', 'User'))
     
-    s_tid = 0
-    if msg.reply_to and msg.reply_to.forum_topic:
-        s_tid = msg.reply_to.reply_to_msg_id
-
     status = TopicManager.get_status(chat.id, s_tid)
-    if status == "paused": return
+    if status == "paused":
+        logger.info(f"[SKIP] Message {msg.id} ignored: Status PAUSED")
+        return
 
     db = TopicManager.load_db()
     c_key, t_key = str(chat.id), str(s_tid)
@@ -225,56 +204,42 @@ async def telethon_handler(event):
         s_tname = None
         if s_tid != 0:
             try:
-                m = await event.client.get_messages(chat.id, ids=[s_tid])
-                if m and m[0].action: s_tname = m[0].action.title
+                m_list = await event.client.get_messages(chat.id, ids=[s_tid])
+                if m_list and m_list[0] and m_list[0].action and isinstance(m_list[0].action, MessageActionTopicCreate):
+                    s_tname = m_list[0].action.title
             except: pass
-        new_tid = await ForumManager.create_topic(chat.id, title, s_tname, s_tid)
+        
+        new_tid = await ForumManager.create_topic(chat.id, chat_title, s_tname, s_tid)
         if new_tid:
-            TopicManager.register_source(chat.id, title, chat_type, s_tid, s_tname, new_tid)
+            TopicManager.register_source(chat.id, chat_title, chat_type, s_tid, s_tname, new_tid)
             target_tid = new_tid
         return new_tid
 
-    if not target_tid or not await ForumManager.topic_exists(target_tid):
+    if not await ForumManager.topic_exists(target_tid):
         if status == "new" and is_private:
-            TopicManager.register_source(chat.id, title, "private", s_tid)
-            print(f"📥 Новое ЛС [{title}] зарегистрировано (выключено).")
+            TopicManager.register_source(chat.id, chat_title, "private", s_tid)
             return
         if not await ensure_topic(): return
 
+    # 2. ПОПЫТКА ПЕРЕСЫЛКИ
     for attempt in range(2):
         try:
-            caption = msg.message or ""
-            params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": target_tid, "caption": caption}
+            params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": target_tid, "caption": msg.message or ""}
             
             if msg.media:
-                # --- ПРОВЕРКА РАЗМЕРА ФАЙЛА ---
-                f_size = 0
-                f_name = "file"
-                if hasattr(msg.media, 'document') and msg.media.document:
-                    f_size = msg.media.document.size
-                    for attr in msg.media.document.attributes:
-                        if hasattr(attr, 'file_name'):
-                            f_name = attr.file_name
-                elif hasattr(msg.media, 'photo') and msg.media.photo:
-                    # У фото берем размер самого большого варианта
-                    f_size = msg.media.photo.sizes[-1].size if hasattr(msg.media.photo, 'sizes') else 0
+                f_size = msg.file.size if msg.file else 0
+                f_name = getattr(msg.file, 'name', 'file') or 'file'
 
                 if f_size > MAX_FILE_SIZE:
-                    size_mb = round(f_size / (1024 * 1024), 2)
-                    print(f"⚠️ Файл слишком большой ({size_mb} MB). Пропуск.")
-                    await bot_app.bot.send_message(
-                        chat_id=TARGET_CHAT_ID, 
-                        message_thread_id=target_tid,
-                        text=f"⚠️ Системой пропущен тяжелый файл: {size_mb} MB\n(Лимит безопасности: {MAX_FILE_SIZE // (1024*1024)} MB)"
-                    )
-                    return # Прерываем, чтобы не забивать RAM
-                # -------------------------------
+                    logger.error(f"[ERROR] Message {msg.id} too large ({f_size} bytes). Skipped.")
+                    await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, message_thread_id=target_tid, text=f"⚠️ Файл пропущен (слишком велик)")
+                    return
 
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
                 buf.seek(0)
-                buf.name = f_name 
-                
+                buf.name = f_name
+
                 if isinstance(msg.media, MessageMediaPhoto):
                     sent = await bot_app.bot.send_photo(photo=buf, **params)
                 else:
@@ -283,15 +248,15 @@ async def telethon_handler(event):
                 sent = await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg.message, message_thread_id=target_tid)
             
             DB.save(msg.id, sent.message_id, target_tid)
+            logger.info(f"[OUTGOING] Success: Source Msg {msg.id} -> Target Msg {sent.message_id} in Topic {target_tid}")
             break
+
         except Exception as e:
-            err = str(e)
-            if "Topic_deleted" in err or "Thread_id_invalid" in err:
-                print(f"⚠️ Топик {target_tid} удален. Пересоздание...")
-                if await ensure_topic(): continue
-                else: break
+            if "Topic_deleted" in str(e) or "Thread_id_invalid" in str(e):
+                logger.warning(f"[RETRY] Topic {target_tid} deleted. Recreating...")
+                await ensure_topic(); continue
             else:
-                print(f"❌ Ошибка пересылки: {e}")
+                logger.error(f"[ERROR] Outgoing failed for Msg {msg.id}: {e}")
                 break
 
 async def telethon_edit_handler(event):
@@ -300,30 +265,38 @@ async def telethon_edit_handler(event):
     if not rel: return
     try:
         txt = (msg.text or "") + f"\n\n(ред. {(datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')})"
-        if msg.media: await bot_app.bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], caption=txt)
-        else: await bot_app.bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], text=txt)
-    except: pass
+        if msg.media:
+            await bot_app.bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], caption=txt)
+        else:
+            await bot_app.bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], text=txt)
+        logger.info(f"[EDIT] Updated message {rel['tgt_id']} in Target")
+    except Exception as e:
+        logger.error(f"[ERROR] Edit failed for {rel['tgt_id']}: {e}")
 
 async def main():
     global client, bot_app
     DB.init()
+    
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     
-    await bot_app.initialize(); await bot_app.start()
+    await bot_app.initialize()
+    await bot_app.start()
+
     client = TelegramClient('support_session', API_ID, API_HASH)
     client.add_event_handler(telethon_handler, events.NewMessage())
     client.add_event_handler(telethon_edit_handler, events.MessageEdited())
-    await client.start()
-
-    print(f"🚀 Бот запущен! Админ: {ADMIN_ID}")
     
+    await client.start()
+    logger.info("🚀 Бот запущен. Логи сетевых запросов отключены.")
+
     async with bot_app:
         await bot_app.updater.start_polling()
         await client.run_until_disconnected()
         await bot_app.updater.stop()
 
 if __name__ == "__main__":
-    if sys.platform.startswith('win'): asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    if sys.platform.startswith('win'):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
