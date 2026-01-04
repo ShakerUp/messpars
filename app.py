@@ -1,46 +1,43 @@
 import asyncio
-import csv
 import os
 import sys
 import json
-import signal
 import io
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
-from telethon.tl.types import User, Chat, Channel, MessageActionTopicCreate, MessageMediaPhoto, MessageMediaDocument
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon.tl.types import (
+    User, Chat, Channel, MessageActionTopicCreate, 
+    MessageMediaPhoto, MessageMediaDocument
+)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# ====== ЗАГРУЗКА КОНФИГУРАЦИИ ======
+# ====== КОНФИГУРАЦИЯ ======
 load_dotenv()
 
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
-ALLOWED_CHAT_ID = int(os.getenv('ALLOWED_CHAT_ID', TARGET_CHAT_ID))
+ADMIN_ID = 684460638  
 
-# Файлы
-CHAT_CSV = 'chats_seen.csv'
-MESSAGES_CSV = 'messages_log.csv'
 TOPICS_DB_FILE = 'topics_mapping.json'
-DB_FILE = 'bot_data.db' # База для редактирования
+DB_FILE = 'bot_data.db'
 
-# Глобальные переменные
+# Лимит на размер файла (50 МБ), чтобы защитить оперативную память сервера
+MAX_FILE_SIZE = 50 * 1024 * 1024 
+
 client = None
-bot_app = None 
-seen_chats = set()
-running = True
+bot_app = None
 
-# Исключения (Черный список системных ID + сам бот)
 SYSTEM_IDS = [777000, 1000, 1087968824]
 EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), TARGET_CHAT_ID] + SYSTEM_IDS
 EXCLUDED_TOPICS = [1]
 
-# ====== NEW: DATABASE FOR EDITS ======
+# ====== DATABASE (LOG EDITS) ======
 class DB:
     @staticmethod
     def init():
@@ -60,185 +57,273 @@ class DB:
                 return {"tgt_id": r[0], "tid": r[1]} if r else None
         except: return None
 
-# ====== ТВОЙ TOPIC MANAGER ======
+# ====== TOPIC MANAGER ======
 class TopicManager:
     @staticmethod
-    def load_topics_db():
+    def load_db():
         if not os.path.exists(TOPICS_DB_FILE): return {}
         try:
             with open(TOPICS_DB_FILE, 'r', encoding='utf-8') as f: return json.load(f)
         except: return {}
 
     @staticmethod
-    def save_topics_db(db):
+    def save_db(db):
         with open(TOPICS_DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(db, f, indent=2, ensure_ascii=False)
 
     @staticmethod
-    def _get_db_key(chat_id, source_thread_id):
-        t_id = source_thread_id if source_thread_id else 0
-        return f"{chat_id}_{t_id}"
+    def get_status(chat_id, s_tid=0):
+        db = TopicManager.load_db()
+        chat_data = db.get(str(chat_id))
+        if not chat_data: return "new"
+        if not chat_data.get('enabled', True): return "paused"
+        
+        t_key = str(s_tid or 0)
+        topic_data = chat_data.get('topics', {}).get(t_key)
+        if topic_data and not topic_data.get('enabled', True): return "paused"
+        
+        return "active" if (topic_data and topic_data.get('topic_id')) else "active_need_topic"
 
     @staticmethod
-    def get_topic_id_for_source(chat_id, source_thread_id):
-        db = TopicManager.load_topics_db()
-        key = TopicManager._get_db_key(chat_id, source_thread_id)
-        return db.get(key, {}).get('topic_id')
-
-    @staticmethod
-    def save_topic_for_source(chat_id, source_thread_id, chat_title, dest_topic_id):
-        db = TopicManager.load_topics_db()
-        key = TopicManager._get_db_key(chat_id, source_thread_id)
-        db[key] = {
-            'chat_title': chat_title,
-            'source_thread_id': source_thread_id,
-            'topic_id': dest_topic_id,
-            'created_at': datetime.now(timezone.utc).isoformat()
+    def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
+        db = TopicManager.load_db()
+        c_key, t_key = str(chat_id), str(s_tid or 0)
+        
+        if c_key not in db:
+            default_enabled = False if chat_type == "private" else True
+            db[c_key] = {"title": title, "type": chat_type, "enabled": default_enabled, "topics": {}}
+        
+        existing_topic = db[c_key]["topics"].get(t_key, {})
+        db[c_key]["topics"][t_key] = {
+            "topic_id": target_tid or existing_topic.get('topic_id'),
+            "title": s_tname or existing_topic.get('title') or ("Личка" if chat_type == "private" else (f"Thread {t_key}" if t_key != "0" else "Main")),
+            "enabled": existing_topic.get('enabled', True)
         }
-        TopicManager.save_topics_db(db)
+        TopicManager.save_db(db)
 
-    @staticmethod
-    def remove_topic_mapping(chat_id, source_thread_id):
-        db = TopicManager.load_topics_db()
-        key = TopicManager._get_db_key(chat_id, source_thread_id)
-        if key in db:
-            del db[key]
-            TopicManager.save_topics_db(db)
+# ====== ПАНЕЛЬ УПРАВЛЕНИЯ (UI) ======
+async def show_manage_menu(query, cid, db):
+    cdata = db.get(str(cid))
+    if not cdata:
+        await query.edit_message_text("Ошибка: данные не найдены.")
+        return
+    
+    is_private = cdata.get('type') == 'private'
+    text = (
+        f"⚙️ **Управление:** {cdata['title']}\n"
+        f"ID: `{cid}`\n\n"
+        f"Статус чата: {'✅ ВКЛЮЧЕН' if cdata['enabled'] else '⏸ ПАУЗА'}"
+    )
+    
+    keyboard = [[InlineKeyboardButton(f"{'🔴 ВЫКЛЮЧИТЬ ЧАТ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ ЧАТ'}", callback_data=f"tgc_{cid}")]]
+    
+    if not is_private:
+        keyboard.append([InlineKeyboardButton("--- Ветки чата ---", callback_data="none")])
+        for tid, tdata in cdata['topics'].items():
+            t_status = "🟢" if tdata['enabled'] else "🔴"
+            keyboard.append([InlineKeyboardButton(f"{t_status} {tdata['title']}", callback_data=f"tgt_{cid}_{tid}")])
+    
+    back_target = "list_privates" if is_private else "list_groups"
+    keyboard.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_target)])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-# ====== ТВОЙ CSV MANAGER ======
-class CSVManager:
-    @staticmethod
-    def ensure_csv():
-        if not os.path.exists(CHAT_CSV):
-            with open(CHAT_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['chat_id', 'chat_type', 'chat_title', 'chat_username', 'first_seen_utc'])
-        if not os.path.exists(MESSAGES_CSV):
-            with open(MESSAGES_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timestamp_utc', 'chat_id', 'chat_title', 'sender_id', 'sender_username', 'message_id', 'has_media', 'text_truncated'])
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    keyboard = [
+        [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
+        [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]
+    ]
+    text = "📂 **Главное меню:**\nВыберите категорию источников:"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-    @staticmethod
-    async def register_chat(chat):
-        chat_id = getattr(chat, 'id', None)
-        if chat_id is None or chat_id in seen_chats: return
-        seen_chats.add(chat_id)
-        ctype = type(chat).__name__
-        title = getattr(chat, 'title', getattr(chat, 'first_name', 'N/A'))
-        username = getattr(chat, 'username', '')
-        with open(CHAT_CSV, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([chat_id, ctype, title, username, datetime.now(timezone.utc).isoformat()])
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID or query.data == "none":
+        await query.answer(); return
+    
+    await query.answer()
+    db = TopicManager.load_db()
+    data = query.data
 
-# ====== FORUM MANAGER (С ТВОЕЙ ЛОГИКОЙ + DB SAVE) ======
+    if data in ["list_groups", "list_privates"]:
+        target_is_private = (data == "list_privates")
+        keyboard = []
+        for cid, d in db.items():
+            is_private = (d.get('type') == 'private')
+            if is_private == target_is_private:
+                status = "✅" if d['enabled'] else "⏸"
+                keyboard.append([InlineKeyboardButton(f"{status} {d['title']}", callback_data=f"manage_{cid}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="main_menu")])
+        await query.edit_message_text(f"📂 **Список: {'Лички' if target_is_private else 'Группы'}**", 
+                                    reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif data.startswith("manage_"):
+        await show_manage_menu(query, data.split("_")[1], db)
+
+    elif data.startswith("tgc_"):
+        cid = data.split("_")[1]
+        db[cid]['enabled'] = not db[cid]['enabled']
+        TopicManager.save_db(db)
+        await show_manage_menu(query, cid, db)
+
+    elif data.startswith("tgt_"):
+        _, cid, tid = data.split("_")
+        db[cid]['topics'][tid]['enabled'] = not db[cid]['topics'][tid]['enabled']
+        TopicManager.save_db(db)
+        await show_manage_menu(query, cid, db)
+
+    elif data == "main_menu":
+        await cmd_list(update, context)
+
+# ====== FORUM MANAGER ======
 class ForumManager:
     @staticmethod
     async def topic_exists(topic_id):
-        if topic_id in EXCLUDED_TOPICS: return False
+        if not topic_id or int(topic_id) <= 1: return False
         try:
-            await bot_app.bot.edit_forum_topic(chat_id=TARGET_CHAT_ID, message_thread_id=topic_id)
+            await bot_app.bot.edit_forum_topic(chat_id=TARGET_CHAT_ID, message_thread_id=int(topic_id))
             return True
         except: return False
 
     @staticmethod
-    async def create_topic(chat_id, chat_title, source_thread_name=None, source_thread_id=None):
+    async def create_topic(chat_id, chat_title, s_tname=None, s_tid=None):
         try:
-            topic_name = (f"{source_thread_name} | {chat_title}" if source_thread_name else f"💬 {chat_title}")[:120]
-            result = await bot_app.bot.create_forum_topic(chat_id=TARGET_CHAT_ID, name=topic_name)
-            topic_id = result.message_thread_id
-            
-            await bot_app.bot.send_message(
-                chat_id=TARGET_CHAT_ID, message_thread_id=topic_id,
-                text=f"📢 **{topic_name}**\nID чата: `{chat_id}`", parse_mode='Markdown'
-            )
-            TopicManager.save_topic_for_source(chat_id, source_thread_id, chat_title, topic_id)
-            return topic_id
+            name = (f"{s_tname} | {chat_title}" if s_tname else f"💬 {chat_title}")[:120]
+            res = await bot_app.bot.create_forum_topic(chat_id=TARGET_CHAT_ID, name=name)
+            tid = res.message_thread_id
+            await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, message_thread_id=tid, text=f"📢 {name}\nID: {chat_id}")
+            return tid
         except Exception as e:
             print(f"❌ Ошибка создания темы: {e}"); return None
 
-    @staticmethod
-    async def get_or_create_topic(chat_id, chat_title, source_thread_id=None, source_thread_name=None):
-        tid = TopicManager.get_topic_id_for_source(chat_id, source_thread_id)
-        if tid and await ForumManager.topic_exists(tid): return tid
-        if tid: TopicManager.remove_topic_mapping(chat_id, source_thread_id)
-        return await ForumManager.create_topic(chat_id, chat_title, source_thread_name, source_thread_id)
-
-# ====== HANDLERS ======
-
-async def all_message_handler(event):
+# ====== ОБРАБОТЧИК СООБЩЕНИЙ ======
+async def telethon_handler(event):
     msg = event.message
     if msg.sender_id in EXCLUDED_SENDERS: return
-    if not msg.message and not msg.media: return
-
     chat = await event.get_chat()
-    chat_id = chat.id
-    await CSVManager.register_chat(chat)
     
-    title = getattr(chat, 'title', getattr(chat, 'first_name', 'Private'))
+    is_private = isinstance(chat, User)
+    chat_type = "private" if is_private else ("channel" if getattr(chat, 'broadcast', False) else "group")
+    title = getattr(chat, 'title', getattr(chat, 'first_name', 'User'))
     
-    # Твоя логика получения инфо о топике
-    s_tid, s_tname = None, None
+    s_tid = 0
     if msg.reply_to and msg.reply_to.forum_topic:
         s_tid = msg.reply_to.reply_to_msg_id
+
+    status = TopicManager.get_status(chat.id, s_tid)
+    if status == "paused": return
+
+    db = TopicManager.load_db()
+    c_key, t_key = str(chat.id), str(s_tid)
+    target_tid = db.get(c_key, {}).get('topics', {}).get(t_key, {}).get('topic_id')
+
+    async def ensure_topic():
+        nonlocal target_tid
+        s_tname = None
+        if s_tid != 0:
+            try:
+                m = await event.client.get_messages(chat.id, ids=[s_tid])
+                if m and m[0].action: s_tname = m[0].action.title
+            except: pass
+        new_tid = await ForumManager.create_topic(chat.id, title, s_tname, s_tid)
+        if new_tid:
+            TopicManager.register_source(chat.id, title, chat_type, s_tid, s_tname, new_tid)
+            target_tid = new_tid
+        return new_tid
+
+    if not target_tid or not await ForumManager.topic_exists(target_tid):
+        if status == "new" and is_private:
+            TopicManager.register_source(chat.id, title, "private", s_tid)
+            print(f"📥 Новое ЛС [{title}] зарегистрировано (выключено).")
+            return
+        if not await ensure_topic(): return
+
+    for attempt in range(2):
         try:
-            m = await event.client.get_messages(chat_id, ids=[s_tid])
-            if m and m[0].action and isinstance(m[0].action, MessageActionTopicCreate):
-                s_tname = m[0].action.title
-        except: pass
+            caption = msg.message or ""
+            params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": target_tid, "caption": caption}
+            
+            if msg.media:
+                # --- ПРОВЕРКА РАЗМЕРА ФАЙЛА ---
+                f_size = 0
+                f_name = "file"
+                if hasattr(msg.media, 'document') and msg.media.document:
+                    f_size = msg.media.document.size
+                    for attr in msg.media.document.attributes:
+                        if hasattr(attr, 'file_name'):
+                            f_name = attr.file_name
+                elif hasattr(msg.media, 'photo') and msg.media.photo:
+                    # У фото берем размер самого большого варианта
+                    f_size = msg.media.photo.sizes[-1].size if hasattr(msg.media.photo, 'sizes') else 0
 
-    # Твоя логика отправки медиа/текста
-    target_tid = await ForumManager.get_or_create_topic(chat_id, title, s_tid, s_tname)
-    if not target_tid: return
+                if f_size > MAX_FILE_SIZE:
+                    size_mb = round(f_size / (1024 * 1024), 2)
+                    print(f"⚠️ Файл слишком большой ({size_mb} MB). Пропуск.")
+                    await bot_app.bot.send_message(
+                        chat_id=TARGET_CHAT_ID, 
+                        message_thread_id=target_tid,
+                        text=f"⚠️ Системой пропущен тяжелый файл: {size_mb} MB\n(Лимит безопасности: {MAX_FILE_SIZE // (1024*1024)} MB)"
+                    )
+                    return # Прерываем, чтобы не забивать RAM
+                # -------------------------------
 
-    try:
-        txt = msg.message or ""
-        p = {"chat_id": TARGET_CHAT_ID, "message_thread_id": target_tid, "caption": txt}
-        if msg.media:
-            buf = io.BytesIO(); await msg.download_media(file=buf); buf.seek(0)
-            if isinstance(msg.media, MessageMediaPhoto):
-                sent = await bot_app.bot.send_photo(photo=buf, **p)
+                buf = io.BytesIO()
+                await msg.download_media(file=buf)
+                buf.seek(0)
+                buf.name = f_name 
+                
+                if isinstance(msg.media, MessageMediaPhoto):
+                    sent = await bot_app.bot.send_photo(photo=buf, **params)
+                else:
+                    sent = await bot_app.bot.send_document(document=buf, **params)
             else:
-                sent = await bot_app.bot.send_document(document=buf, **p)
-        else:
-            sent = await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, text=txt, message_thread_id=target_tid)
-        
-        # Сохраняем для редактирования
-        DB.save(msg.id, sent.message_id, target_tid)
-    except Exception as e: print(f"❌ Ошибка отправки: {e}")
+                sent = await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg.message, message_thread_id=target_tid)
+            
+            DB.save(msg.id, sent.message_id, target_tid)
+            break
+        except Exception as e:
+            err = str(e)
+            if "Topic_deleted" in err or "Thread_id_invalid" in err:
+                print(f"⚠️ Топик {target_tid} удален. Пересоздание...")
+                if await ensure_topic(): continue
+                else: break
+            else:
+                print(f"❌ Ошибка пересылки: {e}")
+                break
 
-async def edit_handler(event):
+async def telethon_edit_handler(event):
     msg = event.message
     rel = DB.get(msg.id)
     if not rel: return
     try:
-        now = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
-        txt = (msg.text or "") + f"\n\n(ред. {now})"
-        if msg.media:
-            await bot_app.bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], caption=txt)
-        else:
-            await bot_app.bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], text=txt)
-    except Exception as e:
-        if "Message is not modified" not in str(e): print(f"❌ Ошибка правки: {e}")
-
-# ====== STARTUP ======
+        txt = (msg.text or "") + f"\n\n(ред. {(datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')})"
+        if msg.media: await bot_app.bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], caption=txt)
+        else: await bot_app.bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], text=txt)
+    except: pass
 
 async def main():
     global client, bot_app
-    CSVManager.ensure_csv()
     DB.init()
-    
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    await bot_app.initialize(); await bot_app.start()
-
-    client = TelegramClient('support_session', API_ID, API_HASH)
-    client.add_event_handler(all_message_handler, events.NewMessage())
-    client.add_event_handler(edit_handler, events.MessageEdited())
+    bot_app.add_handler(CommandHandler("list", cmd_list))
+    bot_app.add_handler(CallbackQueryHandler(callback_handler))
     
+    await bot_app.initialize(); await bot_app.start()
+    client = TelegramClient('support_session', API_ID, API_HASH)
+    client.add_event_handler(telethon_handler, events.NewMessage())
+    client.add_event_handler(telethon_edit_handler, events.MessageEdited())
     await client.start()
-    print("🚀 Бот запущен 1 в 1 как раньше + РЕДАКТИРОВАНИЕ.")
-    await client.run_until_disconnected()
+
+    print(f"🚀 Бот запущен! Админ: {ADMIN_ID}")
+    
+    async with bot_app:
+        await bot_app.updater.start_polling()
+        await client.run_until_disconnected()
+        await bot_app.updater.stop()
 
 if __name__ == "__main__":
-    if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    if sys.platform.startswith('win'): asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
