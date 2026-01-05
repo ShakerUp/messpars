@@ -182,20 +182,12 @@ async def telethon_handler(event):
     # 1. ЛОГИРУЕМ ПОЛУЧЕНИЕ (RAW DATA)
     chat_title = getattr(chat, 'title', getattr(chat, 'first_name', 'Unknown'))
     s_tid = 0
-
-# 1️⃣ Явный forum topic
-    if msg.reply_to and msg.reply_to.reply_to_top_id:
-        s_tid = msg.reply_to.reply_to_top_id
-
-    # 2️⃣ Сообщение-создатель топика
-    elif msg.action and isinstance(msg.action, MessageActionTopicCreate):
-        s_tid = msg.id
-
-    # 3️⃣ FALLBACK: ищем по предыдущим сообщениям
-    else:
-        rel = DB.get(msg.id)
-        if rel:
-            s_tid = rel["tid"]
+    if msg.reply_to:
+        # если сообщение внутри форумной ветки
+      if msg.reply_to.reply_to_top_id:
+          s_tid = msg.reply_to.reply_to_top_id
+      else:
+          s_tid = msg.reply_to.reply_to_msg_id or 0
 
     logger.info(f"[INCOMING] Chat: {chat_title} ({chat.id}) | Message ID: {msg.id} | Raw Data: {msg.to_dict()}")
 
