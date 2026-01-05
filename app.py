@@ -17,18 +17,17 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ (ТОЛЬКО ДАННЫЕ) ======
-LOG_FILE = "bot_messages.log" # Вынесли в переменную для удобства доступа
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.FileHandler("bot_messages.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+# Полностью глушим системные логи библиотек
 logging.getLogger("httpx").setLevel(logging.CRITICAL)
 logging.getLogger("telegram").setLevel(logging.CRITICAL)
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
@@ -112,22 +111,6 @@ class TopicManager:
         }
         TopicManager.save_db(db)
 
-# ====== ФУНКЦИЯ ОТПРАВКИ ЛОГОВ ======
-async def send_logs_file(context, chat_id):
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    filename=f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
-                    caption=f"📄 Файл логов на {datetime.now().strftime('%H:%M:%S')}"
-                )
-        except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка при отправке файла: {e}")
-    else:
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ Файл логов еще не создан.")
-
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 async def show_manage_menu(query, cid, db):
     cdata = db.get(str(cid))
@@ -146,30 +129,16 @@ async def show_manage_menu(query, cid, db):
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    keyboard = [
-        [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
-        [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")],
-        [InlineKeyboardButton("📄 ВЫКАЧАТЬ ЛОГИ", callback_data="download_logs")] # Добавленная кнопка
-    ]
+    keyboard = [[InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")], [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]]
     text = "📂 **Главное меню:**"
     if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await send_logs_file(context, update.effective_chat.id)
-
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID or query.data == "none": await query.answer(); return
-    
-    data = query.data
-    await query.answer()
-    db = TopicManager.load_db()
-
-    if data == "download_logs":
-        await send_logs_file(context, query.message.chat_id)
-    elif data in ["list_groups", "list_privates"]:
+    await query.answer(); db = TopicManager.load_db(); data = query.data
+    if data in ["list_groups", "list_privates"]:
         target_priv = (data == "list_privates")
         kb = [[InlineKeyboardButton(f"{'✅' if d['enabled'] else '⏸'} {d['title']}", callback_data=f"manage_{cid}")] for cid, d in db.items() if (d.get('type') == 'private') == target_priv]
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
@@ -210,10 +179,15 @@ async def telethon_handler(event):
     if msg.sender_id in EXCLUDED_SENDERS: return
     chat = await event.get_chat()
     
+    # 1. ЛОГИРУЕМ ПОЛУЧЕНИЕ (RAW DATA)
     chat_title = getattr(chat, 'title', getattr(chat, 'first_name', 'Unknown'))
     s_tid = 0
     if msg.reply_to:
-        s_tid = msg.reply_to.reply_to_msg_id or 0
+        # если сообщение внутри форумной ветки
+      if msg.reply_to.reply_to_top_id:
+          s_tid = msg.reply_to.reply_to_top_id
+      else:
+          s_tid = msg.reply_to.reply_to_msg_id or 0
 
     logger.info(f"[INCOMING] Chat: {chat_title} ({chat.id}) | Message ID: {msg.id} | Raw Data: {msg.to_dict()}")
 
@@ -251,6 +225,7 @@ async def telethon_handler(event):
             return
         if not await ensure_topic(): return
 
+    # 2. ПОПЫТКА ПЕРЕСЫЛКИ
     for attempt in range(2):
         try:
             params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": target_tid, "caption": msg.message or ""}
@@ -308,7 +283,6 @@ async def main():
     
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("list", cmd_list))
-    bot_app.add_handler(CommandHandler("logs", cmd_logs)) # Быстрая команда
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     
     await bot_app.initialize()
