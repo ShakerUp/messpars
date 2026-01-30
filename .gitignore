@@ -9,6 +9,7 @@
 *.csv
 *.json
 *.log
+*.db
 
 # Python
 __pycache__/
