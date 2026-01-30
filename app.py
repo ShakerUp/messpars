@@ -339,20 +339,34 @@ async def telethon_handler(event):
                 "chat_id": TARGET_CHAT_ID,
                 "message_thread_id": int(target_tid),
                 "reply_to_message_id": current_reply_id,
-                "caption": msg.message or ""
             }
 
             if msg.media:
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
                 buf.seek(0)
-                buf.name = getattr(msg.file, 'name', 'file') or 'file'
+                
+                # Определяем имя файла
+                f_name = getattr(msg.file, 'name', 'file') or 'file'
+                buf.name = f_name
+
+                # ПРОВЕРКА НА VOICE (Голосовое сообщение)
+                is_voice = False
+                if isinstance(msg.media, MessageMediaDocument):
+                    for attr in msg.media.document.attributes:
+                        if hasattr(attr, 'voice') and attr.voice:
+                            is_voice = True
+                            break
+
                 if isinstance(msg.media, MessageMediaPhoto):
-                    sent = await bot_app.bot.send_photo(photo=buf, **send_kwargs)
+                    sent = await bot_app.bot.send_photo(photo=buf, caption=msg.message or "", **send_kwargs)
+                elif is_voice:
+                    # Отправляем как голосовое сообщение
+                    sent = await bot_app.bot.send_voice(voice=buf, caption=msg.message or "", **send_kwargs)
                 else:
-                    sent = await bot_app.bot.send_document(document=buf, **send_kwargs)
+                    # Отправляем как обычный документ/файл
+                    sent = await bot_app.bot.send_document(document=buf, caption=msg.message or "", **send_kwargs)
             else:
-                send_kwargs.pop("caption")
                 sent = await bot_app.bot.send_message(text=msg.message, **send_kwargs)
 
             # Если дошли сюда — отправка успешна
@@ -363,10 +377,9 @@ async def telethon_handler(event):
 
         except Exception as e:
             err_msg = str(e)
-            # Если ошибка в том, что сообщение для ответа не найдено
             if "Message to be replied not found" in err_msg or "Reply_message_id_invalid" in err_msg:
                 logger.warning(f"[RETRY] Сообщение для ответа удалено в топике {target_tid}. Пробую отправить без Reply...")
-                continue # Идем на вторую попытку (attempt == 1)
+                continue 
             else:
                 logger.error(f"Ошибка финальной отправки: {e}")
                 break
