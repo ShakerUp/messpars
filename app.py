@@ -239,73 +239,150 @@ class ForumManager:
             logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
             return None
 
-# ====== ОБРАБОТЧИК СООБЩЕНИЙ ======
 async def telethon_handler(event):
     msg = event.message
-    if msg.sender_id in EXCLUDED_SENDERS: return
-    
+    if msg.sender_id in EXCLUDED_SENDERS:
+        return
+
     chat = await event.get_chat()
+    sender = await event.get_sender()
+
     chat_title = getattr(chat, 'title', getattr(chat, 'first_name', 'Unknown'))
     is_private = isinstance(chat, User)
     chat_type = "private" if is_private else ("channel" if getattr(chat, 'broadcast', False) else "group")
-    
+
     db_data = TopicManager.load_db()
     chat_id_str = str(chat.id)
     chat_conf = db_data.get(chat_id_str, {})
-    
-    # ОПРЕДЕЛЕНИЕ ТАРГЕТ КАНАЛА
+
     final_target_chat = chat_conf.get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
 
+    # =====================================================
+    # 👤 ИМЯ ОТПРАВИТЕЛЯ (НЕ ТРОГАЛ)
+    # =====================================================
+    if isinstance(chat, Channel) and getattr(chat, 'broadcast', False):
+        sender_name = chat_title
+    elif isinstance(sender, User):
+        first = sender.first_name or ""
+        last = sender.last_name or ""
+        sender_name = (first + " " + last).strip() or sender.username or "Unknown"
+    else:
+        sender_name = chat_title
+
+    # =====================================================
+    # 1. ОПРЕДЕЛЯЕМ ИСХОДНЫЙ ТОПИК
+    # =====================================================
     source_top_id = 0
     reply_to_target_id = None
-    
-    if msg.reply_to:
-        source_top_id = msg.reply_to.reply_to_top_id or 0
-        mapping = DB.get(msg.reply_to.reply_to_msg_id)
-        if mapping: reply_to_target_id = mapping['tgt_id']
+    reply_mapping = None
 
+    if msg.reply_to:
+        reply_mapping = DB.get(msg.reply_to.reply_to_msg_id)
+
+        if reply_mapping:
+            reply_to_target_id = reply_mapping['tgt_id']
+            source_top_id = reply_mapping.get('tid', 0)
+        else:
+            source_top_id = msg.reply_to.reply_to_top_id or 0
+
+    elif getattr(msg, "reply_to_top_id", None):
+        source_top_id = msg.reply_to_top_id
+
+    # 🔥 ВАЖНО: если это обычное сообщение в топике (не reply)
+    elif getattr(msg, "message_thread_id", None):
+        source_top_id = msg.message_thread_id
+
+    # =====================================================
+    # 2. ИЩЕМ ЦЕЛЕВОЙ ТОПИК
+    # =====================================================
     target_tid = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('topic_id')
-    if not target_tid and not is_private:
-        target_tid = chat_conf.get('topics', {}).get("0", {}).get('topic_id')
+
+    if not target_tid and reply_mapping:
+        target_tid = reply_mapping.get('tid')
+
+    if target_tid is not None and int(target_tid) <= 1:
+        target_tid = None
 
     status = TopicManager.get_status(chat.id, source_top_id)
     if status == "paused":
-        logger.info(f"[SKIP] Чат/Ветка {chat_id_str}/{source_top_id} на паузе")
         return
 
-    # Создание топика если его нет
-    if not target_tid:
-        if status == "new" and is_private:
-            logger.info(f"[NEW] Новая личка {chat_id_str}, регистрирую...")
-            TopicManager.register_source(chat.id, chat_title, "private", 0)
-            return
-        
-        logger.info(f"[AUTO] Топик не найден для {chat_title} ({source_top_id}). Создаю в {final_target_chat}...")
-        new_tid = await ForumManager.create_topic(final_target_chat, chat_title)
-        if not new_tid: 
-            logger.error("[FATAL] Не удалось создать топик. Прерываю отправку.")
-            return
-        target_tid = new_tid
-        TopicManager.register_source(chat.id, chat_title, chat_type, source_top_id, target_tid=new_tid)
+    # =====================================================
+    # 🔥 ИСПРАВЛЕННЫЙ БЛОК ПОЛУЧЕНИЯ НАЗВАНИЯ ВЕТКИ
+    # =====================================================
+    source_topic_title = None
 
+    if (
+        not is_private
+        and source_top_id
+        and int(source_top_id) > 0
+        and not target_tid
+    ):
+        try:
+            from telethon.tl.functions.channels import GetForumTopicsByIDRequest
+
+            res = await client(
+                GetForumTopicsByIDRequest(
+                    channel=chat,
+                    topics=[int(source_top_id)]
+                )
+            )
+
+            if res and getattr(res, "topics", None):
+                topic_obj = res.topics[0]
+                source_topic_title = getattr(topic_obj, "title", None)
+
+        except Exception as e:
+            logger.warning(f"[TOPIC TITLE ERROR] {e}")
+
+    # =====================================================
+    # 4. ФОРМИРУЕМ ТЕКСТ
+    # =====================================================
+    original_text = msg.message or ""
+    prefixed_text = f"({sender_name})\n\n{original_text}" if original_text else f"({sender_name})"
+
+    # =====================================================
+    # 5. ОТПРАВКА
+    # =====================================================
     success = False
-    logger.info(f"[SENDING] Message {msg.id} from {chat_title} ➡️ Channel {final_target_chat}, Topic {target_tid}")
-    
+
     for attempt in range(2):
+
+        if not target_tid:
+            if status == "new" and is_private:
+                TopicManager.register_source(chat.id, chat_title, "private", 0)
+                return
+
+            logger.info(f"[AUTO] Создаю новый топик для {chat_title} (Source: {source_top_id})...")
+            target_tid = await ForumManager.create_topic(
+                final_target_chat,
+                chat_title,
+                s_tname=source_topic_title
+            )
+
+            if not target_tid:
+                return
+
+            TopicManager.register_source(
+                chat.id,
+                chat_title,
+                chat_type,
+                source_top_id,
+                s_tname=source_topic_title,
+                target_tid=target_tid
+            )
+
         try:
             current_reply_id = reply_to_target_id if attempt == 0 else None
-            
-            # Базовые аргументы (всегда общие)
+
             send_kwargs = {
                 "chat_id": final_target_chat,
                 "message_thread_id": int(target_tid),
-                "reply_to_message_id": current_reply_id,
+                "reply_to_message_id": current_reply_id
             }
 
             if msg.media:
-                # Для медиа добавляем caption
-                send_kwargs["caption"] = msg.message or ""
-                
+                send_kwargs["caption"] = prefixed_text
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
                 buf.seek(0)
@@ -313,29 +390,51 @@ async def telethon_handler(event):
 
                 if isinstance(msg.media, MessageMediaPhoto):
                     sent = await bot_app.bot.send_photo(photo=buf, **send_kwargs)
-                elif any(hasattr(a, 'voice') and a.voice for a in getattr(msg.media.document, 'attributes', [])) if hasattr(msg.media, 'document') else False:
+
+                elif (
+                    hasattr(msg.media, 'document')
+                    and any(hasattr(a, 'voice') and a.voice for a in msg.media.document.attributes)
+                ):
                     sent = await bot_app.bot.send_voice(voice=buf, **send_kwargs)
+
                 else:
                     sent = await bot_app.bot.send_document(document=buf, **send_kwargs)
+
             else:
-                # Для обычного текста используем аргумент 'text', а не 'caption'
-                sent = await bot_app.bot.send_message(text=msg.message, **send_kwargs)
+                sent = await bot_app.bot.send_message(
+                    text=prefixed_text,
+                    **send_kwargs
+                )
 
             DB.save(msg.id, sent.message_id, int(target_tid))
-            logger.info(f"[SUCCESS] Message {msg.id} forwarded as {sent.message_id}")
+
+            logger.info(f"[SUCCESS] {msg.id} (Source:{source_top_id}) ➡️ Topic {target_tid}")
             success = True
             break
+
         except Exception as e:
             err_str = str(e)
-            if ("reply" in err_str.lower() or "Message to be replied not found" in err_str) and attempt == 0:
-                logger.warning(f"[RETRY] Ошибка Reply, пробую без него для {msg.id}")
+
+            if "Message thread not found" in err_str or "thread" in err_str.lower():
+                logger.warning(f"[RE-CREATE] Ветка {target_tid} невалидна. Пересоздаю...")
+
+                db_data = TopicManager.load_db()
+                if chat_id_str in db_data and str(source_top_id) in db_data[chat_id_str]['topics']:
+                    db_data[chat_id_str]['topics'][str(source_top_id)]['topic_id'] = None
+                    TopicManager.save_db(db_data)
+
+                target_tid = None
                 continue
+
+            elif "reply" in err_str.lower() or "Message to be replied not found" in err_str:
+                continue
+
             else:
-                logger.error(f"[SEND ERROR] Попытка {attempt+1} провалена для {msg.id}: {e}")
+                logger.error(f"[ERROR] {e}")
                 break
 
     if not success:
-        logger.error(f"[FATAL] Не удалось отправить сообщение {msg.id} после всех попыток")
+        logger.error(f"[FATAL] Не удалось отправить {msg.id}")
 
 async def telethon_edit_handler(event):
     msg = event.message
