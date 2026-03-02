@@ -60,17 +60,36 @@ class DB:
             conn.execute('CREATE TABLE IF NOT EXISTS msg_map (src_id INTEGER PRIMARY KEY, tgt_id INTEGER, tid INTEGER, custom_target_id INTEGER)')
 
     @staticmethod
-    def save(src_id, tgt_id, tid):
+    def save(src_id, tgt_chat_id, tgt_id, tid):
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute('INSERT OR REPLACE INTO msg_map (src_id, tgt_id, tid) VALUES (?, ?, ?)', (src_id, tgt_id, tid))
-
+            conn.execute(
+                '''
+                INSERT OR REPLACE INTO msg_map 
+                (src_id, tgt_id, tid, custom_target_id)
+                VALUES (?, ?, ?, ?)
+                ''',
+                (src_id, tgt_id, tid, tgt_chat_id)
+            )
+            
     @staticmethod
     def get(src_id):
-        try:
-            with sqlite3.connect(DB_FILE) as conn:
-                r = conn.execute('SELECT tgt_id, tid FROM msg_map WHERE src_id = ?', (src_id,)).fetchone()
-                return {"tgt_id": r[0], "tid": r[1]} if r else None
-        except: return None
+        with sqlite3.connect(DB_FILE) as conn:
+            r = conn.execute(
+                '''
+                SELECT tgt_id, tid, custom_target_id 
+                FROM msg_map 
+                WHERE src_id = ?
+                ''',
+                (src_id,)
+            ).fetchone()
+
+            if r:
+                return {
+                    "tgt_id": r[0],
+                    "tid": r[1],
+                    "tgt_chat_id": r[2]
+                }
+            return None
 
 # ====== TOPIC MANAGER ======
 class TopicManager:
@@ -413,7 +432,12 @@ async def telethon_handler(event):
                 )
 
             # Сохраняем маппинг с правильным source_top_id
-            DB.save(msg.id, sent.message_id, int(target_tid))
+            DB.save(
+              msg.id,
+              final_target_chat,
+              sent.message_id,
+              int(target_tid)
+          )
 
             logger.info(f"[SUCCESS] Msg {msg.id} (Source Topic:{source_top_id}) ➡️ Target Msg {sent.message_id} (Target Topic:{target_tid})")
             success = True
@@ -452,9 +476,7 @@ async def telethon_edit_handler(event):
         logger.warning(f"[EDIT] Нет маппинга для сообщения {msg.id}")
         return
     
-    db_data = TopicManager.load_db()
-    chat_id_str = str(event.chat_id)
-    target_chat = db_data.get(chat_id_str, {}).get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
+    target_chat = rel["tgt_chat_id"]
     
     try:
         # Формируем обновленный текст
