@@ -46,6 +46,23 @@ TOPICS_DB_FILE = 'topics_mapping.json'
 DB_FILE = 'bot_data.db'
 MAX_FILE_SIZE = 50 * 1024 * 1024 
 
+# ====== USER COLOR SYSTEM ======
+
+USER_MARKERS = [
+    "🔴","🟠","🟡","🟢","🔵","🟣","🟤",
+    "🔹","🔸","🔺","🔻","🔷","🔶","💠"
+]
+
+def get_user_marker(user_id: int):
+    if not user_id:
+        return "🔹"
+    return USER_MARKERS[user_id % len(USER_MARKERS)]
+
+# режим отображения:
+# "compact"  -> 🔹 Андрей: текст
+# "classic"  -> 🔵 Андрей \n текст
+DISPLAY_MODE = "compact"
+
 client = None
 bot_app = None
 
@@ -278,17 +295,22 @@ async def telethon_handler(event):
 
     final_target_chat = chat_conf.get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
 
-    # =====================================================
-    # 👤 ИМЯ ОТПРАВИТЕЛЯ
-    # =====================================================
+  # =====================================================
+  # 👤 ИМЯ + ЦВЕТ ОТПРАВИТЕЛЯ
+  # =====================================================
+
+    sender_id = getattr(sender, "id", None)
+
     if isinstance(chat, Channel) and getattr(chat, 'broadcast', False):
-        sender_name = chat_title
+      sender_name = chat_title
     elif isinstance(sender, User):
-        first = sender.first_name or ""
-        last = sender.last_name or ""
-        sender_name = (first + " " + last).strip() or sender.username or "Unknown"
+      first = sender.first_name or ""
+      last = sender.last_name or ""
+      sender_name = (first + " " + last).strip() or sender.username or "Unknown"
     else:
-        sender_name = chat_title
+      sender_name = chat_title
+
+    user_marker = get_user_marker(sender_id)
 
 # =====================================================
     # 🔥 ИСПРАВЛЕННАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ ТОПИКА
@@ -364,7 +386,18 @@ async def telethon_handler(event):
     # 4. ФОРМИРУЕМ ТЕКСТ
     # =====================================================
     original_text = msg.message or ""
-    prefixed_text = f"({sender_name})\n\n{original_text}" if original_text else f"({sender_name})"
+    if DISPLAY_MODE == "compact":
+      prefixed_text = (
+          f"{user_marker} <b>{sender_name}:</b>\n{original_text}"
+          if original_text
+          else f"{user_marker} <b>{sender_name}:</b>"
+      )
+    else:  # classic
+      prefixed_text = (
+          f"{user_marker} <b>{sender_name}</b>\n{original_text}"
+          if original_text
+          else f"{user_marker} <b>{sender_name}</b>"
+      )
 
     # =====================================================
     # 5. ОТПРАВКА
@@ -407,6 +440,7 @@ async def telethon_handler(event):
             }
 
             if msg.media:
+                send_kwargs["parse_mode"] = "HTML"
                 send_kwargs["caption"] = prefixed_text
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
@@ -428,6 +462,7 @@ async def telethon_handler(event):
             else:
                 sent = await bot_app.bot.send_message(
                     text=prefixed_text,
+                    parse_mode="HTML",
                     **send_kwargs
                 )
 
