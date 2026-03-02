@@ -13,10 +13,12 @@ from telethon.tl.types import (
     User, Chat, Channel, MessageActionTopicCreate, 
     MessageMediaPhoto, MessageMediaDocument
 )
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telethon.tl.functions.channels import GetForumTopicsByIDRequest
 
-# ====== НАСТРОЙКА ЛОГИРОВАНИЯ (ТОЛЬКО ДАННЫЕ) ======
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+
+# ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(message)s',
@@ -27,7 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Полностью глушим системные логи библиотек
+user_edit_state = {}
+
 logging.getLogger("httpx").setLevel(logging.CRITICAL)
 logging.getLogger("telegram").setLevel(logging.CRITICAL)
 logging.getLogger("telethon").setLevel(logging.CRITICAL)
@@ -38,18 +41,17 @@ load_dotenv()
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
+DEFAULT_TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
 ADMIN_ID = 684460638  
 
 TOPICS_DB_FILE = 'topics_mapping.json'
 DB_FILE = 'bot_data.db'
-MAX_FILE_SIZE = 50 * 1024 * 1024 
 
 client = None
 bot_app = None
 
 SYSTEM_IDS = [777000, 1000, 1087968824]
-EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), TARGET_CHAT_ID] + SYSTEM_IDS
+EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), DEFAULT_TARGET_CHAT_ID] + SYSTEM_IDS
 
 # ====== DATABASE ======
 class DB:
@@ -61,7 +63,7 @@ class DB:
     @staticmethod
     def save(src_id, tgt_id, tid):
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute('INSERT OR REPLACE INTO msg_map VALUES (?, ?, ?)', (src_id, tgt_id, tid))
+            conn.execute('INSERT OR REPLACE INTO msg_map (src_id, tgt_id, tid) VALUES (?, ?, ?)', (src_id, tgt_id, tid))
 
     @staticmethod
     def get(src_id):
@@ -94,19 +96,19 @@ class TopicManager:
         t_key = str(s_tid or 0)
         topic_data = chat_data.get('topics', {}).get(t_key)
         if topic_data and not topic_data.get('enabled', True): return "paused"
-        return "active" if (topic_data and topic_data.get('topic_id')) else "active_need_topic"
+        return "active"
 
     @staticmethod
     def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
         db = TopicManager.load_db()
         c_key, t_key = str(chat_id), str(s_tid or 0)
         if c_key not in db:
-            default_enabled = False if chat_type == "private" else True
-            db[c_key] = {"title": title, "type": chat_type, "enabled": default_enabled, "topics": {}}
+            db[c_key] = {"title": title, "type": chat_type, "enabled": True, "custom_target_id": None, "topics": {}}
+        
         existing_topic = db[c_key]["topics"].get(t_key, {})
         db[c_key]["topics"][t_key] = {
-            "topic_id": target_tid or existing_topic.get('topic_id'),
-            "title": s_tname or existing_topic.get('title') or ("Личка" if chat_type == "private" else (f"Thread {t_key}" if t_key != "0" else "Main")),
+            "topic_id": target_tid if target_tid is not None else existing_topic.get('topic_id'),
+            "title": s_tname or existing_topic.get('title') or f"Thread {t_key}",
             "enabled": existing_topic.get('enabled', True)
         }
         TopicManager.save_db(db)
@@ -116,191 +118,189 @@ async def show_manage_menu(query, cid, db):
     cdata = db.get(str(cid))
     if not cdata: return
     is_private = cdata.get('type') == 'private'
-    text = f"⚙️ **Управление:** {cdata['title']}\nID: `{cid}`\n\nСтатус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}"
-    keyboard = [[InlineKeyboardButton(f"{'🔴 ВЫКЛЮЧИТЬ ЧАТ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ ЧАТ'}", callback_data=f"tgc_{cid}")]]
+    custom_target = cdata.get('custom_target_id') or "Стандарт"
+    
+    text = f"⚙️ **Управление:** {cdata['title']} (`{cid}`)\n🎯 Таргет: `{custom_target}`"
+    
+    keyboard = [
+        [InlineKeyboardButton(f"{'🔴 ВЫКЛЮЧИТЬ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ'}", callback_data=f"tgc_{cid}")],
+        [InlineKeyboardButton("🎯 ИЗМЕНИТЬ КАНАЛ", callback_data=f"editchat_{cid}")],
+        [InlineKeyboardButton("➕ ПРИВЯЗАТЬ ТОПИК (ID:ID)", callback_data=f"addtopic_{cid}")]
+    ]
+    
     if not is_private:
-        keyboard.append([InlineKeyboardButton("--- Ветки чата ---", callback_data="none")])
-        for tid, tdata in cdata['topics'].items():
-            t_status = "🟢" if tdata['enabled'] else "🔴"
-            keyboard.append([InlineKeyboardButton(f"{t_status} {tdata['title']}", callback_data=f"tgt_{cid}_{tid}")])
-    back_target = "list_privates" if is_private else "list_groups"
-    keyboard.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_target)])
+        keyboard.append([InlineKeyboardButton("--- Список веток ---", callback_data="none")])
+        for tid, tdata in cdata.get('topics', {}).items():
+            btn_display = f"{'🟢' if tdata['enabled'] else '🔴'} {tid} ➡️ {tdata.get('topic_id', '???')}"
+            keyboard.append([
+                InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}"),
+                InlineKeyboardButton("❌", callback_data=f"del_{cid}_{tid}")
+            ])
+
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    keyboard = [[InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")], [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]]
-    text = "📂 **Главное меню:**"
-    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("👥 ГРУППЫ", callback_data="list_groups")], [InlineKeyboardButton("👤 ЛИЧКИ", callback_data="list_privates")]]
+    await (update.callback_query.edit_message_text("📂 Меню:", reply_markup=InlineKeyboardMarkup(keyboard)) if update.callback_query else update.message.reply_text("📂 Меню:", reply_markup=InlineKeyboardMarkup(keyboard)))
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query.from_user.id != ADMIN_ID or query.data == "none": await query.answer(); return
-    await query.answer(); db = TopicManager.load_db(); data = query.data
+    query = update.callback_query; await query.answer(); db = TopicManager.load_db(); data = query.data
     if data in ["list_groups", "list_privates"]:
         target_priv = (data == "list_privates")
         kb = [[InlineKeyboardButton(f"{'✅' if d['enabled'] else '⏸'} {d['title']}", callback_data=f"manage_{cid}")] for cid, d in db.items() if (d.get('type') == 'private') == target_priv]
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
-        await query.edit_message_text(f"📂 **Список: {'Лички' if target_priv else 'Группы'}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await query.edit_message_text("📂 Список:", reply_markup=InlineKeyboardMarkup(kb))
     elif data.startswith("manage_"): await show_manage_menu(query, data.split("_")[1], db)
     elif data.startswith("tgc_"):
-        cid = data.split("_")[1]; db[cid]['enabled'] = not db[cid]['enabled']; TopicManager.save_db(db)
-        await show_manage_menu(query, cid, db)
-    elif data.startswith("tgt_"):
-        _, cid, tid = data.split("_"); db[cid]['topics'][tid]['enabled'] = not db[cid]['topics'][tid]['enabled']; TopicManager.save_db(db)
-        await show_manage_menu(query, cid, db)
+        cid = data.split("_")[1]; db[cid]['enabled'] = not db[cid]['enabled']; TopicManager.save_db(db); await show_manage_menu(query, cid, db)
+    elif data.startswith("editchat_"):
+        user_edit_state[query.from_user.id] = {"mode": "target_chat", "cid": data.split("_")[1]}
+        await query.message.reply_text("Введите ID нового канала (или 0 для сброса):")
+    elif data.startswith("addtopic_"):
+        user_edit_state[query.from_user.id] = {"mode": "manual_pair", "cid": data.split("_")[1]}
+        await query.message.reply_text("Введите `SOURCE_ID:TARGET_ID` (например `2:17` для ссылки .../2)")
+    elif data.startswith("editid_"):
+        _, cid, tid = data.split("_"); user_edit_state[query.from_user.id] = {"mode": "topic_id", "cid": cid, "tid": tid}
+        await query.message.reply_text(f"Введите новый Target ID для ветки {tid}:")
+    elif data.startswith("del_"):
+        _, cid, tid = data.split("_"); del db[cid]['topics'][tid]; TopicManager.save_db(db); await show_manage_menu(query, cid, db)
     elif data == "main_menu": await cmd_list(update, context)
+
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID or user_id not in user_edit_state: return
+    state = user_edit_state.pop(user_id); new_input = update.message.text.strip(); db = TopicManager.load_db(); cid = state["cid"]
+    if state["mode"] == "target_chat":
+        db[cid]['custom_target_id'] = int(new_input) if new_input != "0" else None
+    elif state["mode"] == "manual_pair":
+        s_id, t_id = new_input.replace(" ", "").split(":")
+        if cid not in db: db[cid] = {"title": "Manual", "type": "group", "enabled": True, "topics": {}}
+        db[cid]['topics'][str(s_id)] = {"topic_id": int(t_id), "title": f"Thread {s_id}", "enabled": True}
+    elif state["mode"] == "topic_id":
+        db[cid]['topics'][state["tid"]]['topic_id'] = int(new_input)
+    TopicManager.save_db(db); await update.message.reply_text("✅ Сохранено. /list для управления.")
 
 # ====== FORUM MANAGER ======
 class ForumManager:
     @staticmethod
-    async def topic_exists(topic_id):
-        if not topic_id or int(topic_id) <= 1: return False
-        try:
-            await bot_app.bot.edit_forum_topic(chat_id=TARGET_CHAT_ID, message_thread_id=int(topic_id))
-            return True
-        except: return False
-
-    @staticmethod
-    async def create_topic(chat_id, chat_title, s_tname=None, s_tid=None):
+    async def create_topic(target_chat, chat_title, s_tname=None):
         try:
             name = (f"{s_tname} | {chat_title}" if s_tname else f"💬 {chat_title}")[:120]
-            res = await bot_app.bot.create_forum_topic(chat_id=TARGET_CHAT_ID, name=name)
-            tid = res.message_thread_id
-            await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, message_thread_id=tid, text=f"📢 {name}\nID: {chat_id}")
-            return tid
-        except Exception as e: 
-            return None
+            res = await bot_app.bot.create_forum_topic(chat_id=target_chat, name=name)
+            return res.message_thread_id
+        except Exception as e:
+            logger.error(f"Forum Error: {e}"); return None
 
-# ====== ОБРАБОТЧИК СООБЩЕНИЙ ======
+# ====== ГЛАВНЫЙ ОБРАБОТЧИК (ИСПРАВЛЕННЫЙ) ======
 async def telethon_handler(event):
     msg = event.message
     if msg.sender_id in EXCLUDED_SENDERS: return
+    
     chat = await event.get_chat()
+    sender = await event.get_sender()
+    chat_id_str = str(chat.id)
     
-    # 1. ЛОГИРУЕМ ПОЛУЧЕНИЕ (RAW DATA)
-    chat_title = getattr(chat, 'title', getattr(chat, 'first_name', 'Unknown'))
-    s_tid = 0
+    db_data = TopicManager.load_db()
+    chat_conf = db_data.get(chat_id_str, {})
+    
+    # ПРИНУДИТЕЛЬНОЕ ОПРЕДЕЛЕНИЕ ID ВЕТКИ (ТОПИКА)
+    # Мы берем только message_thread_id — это то самое число из ссылки (например, 2)
+    source_top_id = getattr(msg, 'reply_to', None)
+    if source_top_id:
+        source_top_id = getattr(source_top_id, 'reply_to_top_id', 0) or 0
+    else:
+        source_top_id = 0
+
+    # Если Telethon не отдал top_id, но сообщение в ветке, пробуем вытащить из thread_id
+    if source_top_id == 0 and hasattr(msg, 'message_thread_id'):
+        source_top_id = msg.message_thread_id or 0
+
+    # Ищем захардкоженный или созданный маппинг
+    target_tid = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('topic_id')
+    
+    # Фикс для General
+    if target_tid is not None and int(target_tid) <= 1: target_tid = None
+
+    status = TopicManager.get_status(chat.id, source_top_id)
+    if status == "paused": return
+
+    final_target_chat = chat_conf.get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
+
+    # Поиск Reply маппинга
+    reply_to_target_id = None
     if msg.reply_to:
-        # если сообщение внутри форумной ветки
-      if msg.reply_to.reply_to_top_id:
-          s_tid = msg.reply_to.reply_to_top_id
-      else:
-          s_tid = msg.reply_to.reply_to_msg_id or 0
+        mapping = DB.get(msg.reply_to.reply_to_msg_id)
+        if mapping: reply_to_target_id = mapping['tgt_id']
 
-    logger.info(f"[INCOMING] Chat: {chat_title} ({chat.id}) | Message ID: {msg.id} | Raw Data: {msg.to_dict()}")
-
-    is_private = isinstance(chat, User)
-    chat_type = "private" if is_private else ("channel" if getattr(chat, 'broadcast', False) else "group")
-    
-    status = TopicManager.get_status(chat.id, s_tid)
-    if status == "paused":
-        logger.info(f"[SKIP] Message {msg.id} ignored: Status PAUSED")
-        return
-
-    db = TopicManager.load_db()
-    c_key, t_key = str(chat.id), str(s_tid)
-    target_tid = db.get(c_key, {}).get('topics', {}).get(t_key, {}).get('topic_id')
-
-    async def ensure_topic():
-        nonlocal target_tid
-        s_tname = None
-        if s_tid != 0:
-            try:
-                m_list = await event.client.get_messages(chat.id, ids=[s_tid])
-                if m_list and m_list[0] and m_list[0].action and isinstance(m_list[0].action, MessageActionTopicCreate):
-                    s_tname = m_list[0].action.title
-            except: pass
-        
-        new_tid = await ForumManager.create_topic(chat.id, chat_title, s_tname, s_tid)
-        if new_tid:
-            TopicManager.register_source(chat.id, chat_title, chat_type, s_tid, s_tname, new_tid)
-            target_tid = new_tid
-        return new_tid
-
-    if not await ForumManager.topic_exists(target_tid):
-        if status == "new" and is_private:
-            TopicManager.register_source(chat.id, chat_title, "private", s_tid)
-            return
-        if not await ensure_topic(): return
-
-    # 2. ПОПЫТКА ПЕРЕСЫЛКИ
+    # Отправка
+    success = False
     for attempt in range(2):
+        if not target_tid:
+            if is_private := isinstance(chat, User):
+                TopicManager.register_source(chat.id, "Private", "private", 0)
+                return
+            # Автосоздание если нет ручного маппинга
+            logger.info(f"[AUTO] Создаю ветку для источника ID: {source_top_id}")
+            target_tid = await ForumManager.create_topic(final_target_chat, getattr(chat, 'title', 'Unknown'))
+            if not target_tid: return
+            TopicManager.register_source(chat.id, getattr(chat, 'title', 'Group'), "group", source_top_id, target_tid=target_tid)
+
         try:
-            params = {"chat_id": TARGET_CHAT_ID, "message_thread_id": target_tid, "caption": msg.message or ""}
+            # Формируем имя отправителя
+            s_name = getattr(chat, 'title', 'Unknown')
+            if isinstance(sender, User):
+                s_name = f"{(sender.first_name or '')} {(sender.last_name or '')}".strip() or sender.username or "User"
             
+            p_text = f"({s_name})\n\n{msg.message or ''}"
+            cur_reply = reply_to_target_id if attempt == 0 else None
+            
+            kwargs = {"chat_id": final_target_chat, "message_thread_id": int(target_tid), "reply_to_message_id": cur_reply}
+
             if msg.media:
-                f_size = msg.file.size if msg.file else 0
-                f_name = getattr(msg.file, 'name', 'file') or 'file'
-
-                if f_size > MAX_FILE_SIZE:
-                    logger.error(f"[ERROR] Message {msg.id} too large ({f_size} bytes). Skipped.")
-                    await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, message_thread_id=target_tid, text=f"⚠️ Файл пропущен (слишком велик)")
-                    return
-
-                buf = io.BytesIO()
-                await msg.download_media(file=buf)
-                buf.seek(0)
-                buf.name = f_name
-
-                if isinstance(msg.media, MessageMediaPhoto):
-                    sent = await bot_app.bot.send_photo(photo=buf, **params)
-                else:
-                    sent = await bot_app.bot.send_document(document=buf, **params)
+                kwargs["caption"] = p_text
+                buf = io.BytesIO(); await msg.download_media(file=buf); buf.seek(0)
+                buf.name = getattr(msg.file, 'name', 'file') or 'file'
+                if isinstance(msg.media, MessageMediaPhoto): sent = await bot_app.bot.send_photo(photo=buf, **kwargs)
+                elif any(hasattr(a, 'voice') and a.voice for a in getattr(msg.media.document, 'attributes', [])) if hasattr(msg.media, 'document') else False:
+                    sent = await bot_app.bot.send_voice(voice=buf, **kwargs)
+                else: sent = await bot_app.bot.send_document(document=buf, **kwargs)
             else:
-                sent = await bot_app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg.message, message_thread_id=target_tid)
-            
-            DB.save(msg.id, sent.message_id, target_tid)
-            logger.info(f"[OUTGOING] Success: Source Msg {msg.id} -> Target Msg {sent.message_id} in Topic {target_tid}")
+                sent = await bot_app.bot.send_message(text=p_text, **kwargs)
+
+            DB.save(msg.id, sent.message_id, int(target_tid))
+            logger.info(f"[SUCCESS] Msg {msg.id} (SrcID:{source_top_id}) ➡️ Target {target_tid}")
+            success = True; break
+        except Exception as e:
+            if "thread not found" in str(e).lower(): target_tid = None; continue
+            if attempt == 0: continue
             break
 
-        except Exception as e:
-            if "Topic_deleted" in str(e) or "Thread_id_invalid" in str(e):
-                logger.warning(f"[RETRY] Topic {target_tid} deleted. Recreating...")
-                await ensure_topic(); continue
-            else:
-                logger.error(f"[ERROR] Outgoing failed for Msg {msg.id}: {e}")
-                break
-
 async def telethon_edit_handler(event):
-    msg = event.message
-    rel = DB.get(msg.id)
+    msg = event.message; rel = DB.get(msg.id)
     if not rel: return
+    db = TopicManager.load_db(); tid = db.get(str(event.chat_id), {}).get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
     try:
         txt = (msg.text or "") + f"\n\n(ред. {(datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')})"
-        if msg.media:
-            await bot_app.bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], caption=txt)
-        else:
-            await bot_app.bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=rel["tgt_id"], text=txt)
-        logger.info(f"[EDIT] Updated message {rel['tgt_id']} in Target")
-    except Exception as e:
-        logger.error(f"[ERROR] Edit failed for {rel['tgt_id']}: {e}")
+        if msg.media: await bot_app.bot.edit_message_caption(chat_id=tid, message_id=rel["tgt_id"], caption=txt)
+        else: await bot_app.bot.edit_message_text(chat_id=tid, message_id=rel["tgt_id"], text=txt)
+    except: pass
 
 async def main():
     global client, bot_app
     DB.init()
-    
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
-    
-    await bot_app.initialize()
-    await bot_app.start()
-
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
+    await bot_app.initialize(); await bot_app.start()
     client = TelegramClient('support_session', API_ID, API_HASH)
     client.add_event_handler(telethon_handler, events.NewMessage())
     client.add_event_handler(telethon_edit_handler, events.MessageEdited())
-    
-    await client.start()
-    logger.info("🚀 Бот запущен. Логи сетевых запросов отключены.")
-
-    async with bot_app:
-        await bot_app.updater.start_polling()
-        await client.run_until_disconnected()
-        await bot_app.updater.stop()
+    await client.start(); logger.info("🚀 Бот запущен."); async with bot_app:
+        await bot_app.updater.start_polling(); await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    if sys.platform.startswith('win'): asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())

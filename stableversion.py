@@ -546,3 +546,6 @@ if __name__ == "__main__":
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
+    
+    
+//02.03.2026 ВЕРСИЯ
