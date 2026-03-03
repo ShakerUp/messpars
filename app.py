@@ -506,41 +506,70 @@ async def telethon_edit_handler(event):
     log_full_message(event, tag="EDIT")
     msg = event.message
     rel = DB.get(msg.id)
-    
+
     if not rel:
         logger.warning(f"[EDIT] Нет маппинга для сообщения {msg.id}")
         return
-    
+
     target_chat = rel["tgt_chat_id"]
-    
+
     try:
-        # Формируем обновленный текст
-        base_text = msg.text or ""
+        sender = await event.get_sender()
+        chat = await event.get_chat()
+
+        # ===== Имя отправителя =====
+        if isinstance(chat, Channel) and getattr(chat, 'broadcast', False):
+            sender_name = getattr(chat, 'title', 'Unknown')
+            sender_id = getattr(chat, 'id', None)
+        elif isinstance(sender, User):
+            first = sender.first_name or ""
+            last = sender.last_name or ""
+            sender_name = (first + " " + last).strip() or sender.username or "Unknown"
+            sender_id = sender.id
+        else:
+            sender_name = "Unknown"
+            sender_id = None
+
+        # ===== Цвет =====
+        user_marker = get_user_marker(sender_id)
+
+        # ===== Новый текст =====
+        original_text = msg.text or ""
         edit_time = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')
-        updated_text = f"{base_text}\n\n(ред. {edit_time})"
-        
-        logger.info(f"[EDIT] Пытаюсь отредактировать сообщение {rel['tgt_id']} в чате {target_chat}")
-        
-        if msg.media:
-            # Для медиа редактируем только подпись
-            await bot_app.bot.edit_message_caption(
-                chat_id=target_chat, 
-                message_id=rel["tgt_id"], 
-                caption=updated_text
+
+        if DISPLAY_MODE == "compact":
+            updated_text = (
+                f"{user_marker} <b>{sender_name}:</b> {original_text}\n\n"
+                f"<i>(ред. {edit_time})</i>"
             )
         else:
-            # Для текстовых сообщений
-            await bot_app.bot.edit_message_text(
-                chat_id=target_chat, 
-                message_id=rel["tgt_id"], 
-                text=updated_text
+            updated_text = (
+                f"{user_marker} <b>{sender_name}</b>\n"
+                f"{original_text}\n\n"
+                f"<i>(ред. {edit_time})</i>"
             )
-        logger.info(f"[EDIT] Сообщение {rel['tgt_id']} успешно обновлено")
-        
+
+        logger.info(f"[EDIT] Обновляю сообщение {rel['tgt_id']}")
+
+        if msg.media:
+            await bot_app.bot.edit_message_caption(
+                chat_id=target_chat,
+                message_id=rel["tgt_id"],
+                caption=updated_text,
+                parse_mode="HTML"
+            )
+        else:
+            await bot_app.bot.edit_message_text(
+                chat_id=target_chat,
+                message_id=rel["tgt_id"],
+                text=updated_text,
+                parse_mode="HTML"
+            )
+
+        logger.info(f"[EDIT SUCCESS] {rel['tgt_id']} обновлено")
+
     except Exception as e:
-        logger.error(f"[EDIT ERROR] Не удалось отредактировать {rel['tgt_id']}: {e}")
-        # Пробуем найти сообщение по-другому или пересоздать маппинг
-        logger.info(f"[EDIT] Поиск альтернативного сообщения для {msg.id}")
+        logger.error(f"[EDIT ERROR] {e}")
 
 def log_full_message(event, tag="NEW"):
     try:
