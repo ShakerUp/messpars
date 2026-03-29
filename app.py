@@ -311,17 +311,23 @@ class ForumManager:
             logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
             return None
 
-def resolve_source_topic_id(msg) -> int:
-    # Реальный ID форум-ветки источника
+def resolve_source_topic_id(msg, chat_conf=None) -> int:
     if getattr(msg, 'message_thread_id', None):
         return int(msg.message_thread_id)
 
-    # Иногда Telethon кладет корень ветки сюда
     reply_to = getattr(msg, 'reply_to', None)
-    if reply_to and getattr(reply_to, 'reply_to_top_id', None):
+    if not reply_to:
+        return 0
+
+    if getattr(reply_to, 'reply_to_top_id', None):
         return int(reply_to.reply_to_top_id)
 
-    # Если ничего нет — это Main
+    if getattr(reply_to, 'reply_to_msg_id', None):
+        candidate = int(reply_to.reply_to_msg_id)
+        known_topics = (chat_conf or {}).get('topics', {})
+        if str(candidate) in known_topics:
+            return candidate
+
     return 0
 
 async def telethon_handler(event):
@@ -364,7 +370,7 @@ async def telethon_handler(event):
 # =====================================================
     # 🔥 ИСПРАВЛЕННАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ ТОПИКА
     # =====================================================
-    source_top_id = resolve_source_topic_id(msg)
+    source_top_id = resolve_source_topic_id(msg, chat_conf)
 
     # Логика для маппинга ответов (остается без изменений)
     reply_to_target_id = None
