@@ -126,12 +126,29 @@ class TopicManager:
     def get_status(chat_id, s_tid=0):
         db = TopicManager.load_db()
         chat_data = db.get(str(chat_id))
-        if not chat_data: return "new"
-        if not chat_data.get('enabled', True): return "paused"
+
+        logger.info(f"[GET_STATUS] chat_id={chat_id}, s_tid={s_tid}")
+
+        if not chat_data:
+            logger.info("[GET_STATUS] -> new (chat not found)")
+            return "new"
+
+        if not chat_data.get('enabled', True):
+            logger.info("[GET_STATUS] -> paused (chat disabled)")
+            return "paused"
+
         t_key = str(s_tid or 0)
         topic_data = chat_data.get('topics', {}).get(t_key)
-        if topic_data and not topic_data.get('enabled', True): return "paused"
-        return "active" if (topic_data and topic_data.get('topic_id')) else "active_need_topic"
+
+        logger.info(f"[GET_STATUS] t_key={t_key}, topic_data={topic_data}")
+
+        if topic_data and not topic_data.get('enabled', True):
+            logger.info("[GET_STATUS] -> paused (topic disabled)")
+            return "paused"
+
+        result = "active" if (topic_data and topic_data.get('topic_id')) else "active_need_topic"
+        logger.info(f"[GET_STATUS] -> {result}")
+        return result
 
     @staticmethod
     def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
@@ -369,6 +386,13 @@ async def telethon_handler(event):
     if target_tid is not None and int(target_tid) <= 1:
         target_tid = None
 
+    logger.info(
+        f"[THREAD CHECK] chat.id={chat.id}, msg.id={msg.id}, "
+        f"source_top_id={source_top_id}, "
+        f"message_thread_id={getattr(msg, 'message_thread_id', None)}, "
+        f"reply_to_top_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_top_id', None)}, "
+        f"reply_to_msg_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_msg_id', None)}"
+    )
     status = TopicManager.get_status(chat.id, source_top_id)
     if status == "paused":
         return
