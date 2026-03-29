@@ -311,6 +311,19 @@ class ForumManager:
             logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
             return None
 
+def resolve_source_topic_id(msg) -> int:
+    # Реальный ID форум-ветки источника
+    if getattr(msg, 'message_thread_id', None):
+        return int(msg.message_thread_id)
+
+    # Иногда Telethon кладет корень ветки сюда
+    reply_to = getattr(msg, 'reply_to', None)
+    if reply_to and getattr(reply_to, 'reply_to_top_id', None):
+        return int(reply_to.reply_to_top_id)
+
+    # Если ничего нет — это Main
+    return 0
+
 async def telethon_handler(event):
     msg = event.message
     if msg.sender_id in EXCLUDED_SENDERS:
@@ -351,20 +364,7 @@ async def telethon_handler(event):
 # =====================================================
     # 🔥 ИСПРАВЛЕННАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ ТОПИКА
     # =====================================================
-    source_top_id = 0
-    
-    if hasattr(msg, 'reply_to') and msg.reply_to:
-        # 1. Если это ответ внутри ветки, Telethon заполнит reply_to_top_id
-        source_top_id = getattr(msg.reply_to, 'reply_to_top_id', 0) or 0
-        
-        # 2. Если reply_to_top_id пуст, но есть ответ на сообщение, 
-        # проверяем, не является ли сообщение, на которое ответили, ID топика.
-        if source_top_id == 0:
-            source_top_id = getattr(msg.reply_to, 'reply_to_msg_id', 0) or 0
-
-    # Если по какой-то причине всё еще 0, проверяем прямое свойство (иногда доступно в новых версиях)
-    if source_top_id == 0 and hasattr(msg, 'message_thread_id'):
-        source_top_id = msg.message_thread_id or 0
+    source_top_id = resolve_source_topic_id(msg)
 
     # Логика для маппинга ответов (остается без изменений)
     reply_to_target_id = None
