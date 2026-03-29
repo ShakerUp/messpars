@@ -169,13 +169,22 @@ async def show_manage_menu(query, cid, db):
     if not is_private:
         keyboard.append([InlineKeyboardButton("--- Настройка веток ---", callback_data="none")])
         for tid, tdata in cdata.get('topics', {}).items():
-            t_status = "🟢" if tdata['enabled'] else "🔴"
+            t_enabled = tdata.get('enabled', True)
+            t_status = "🟢" if t_enabled else "🔴"
             t_title = tdata.get('title', 'Без названия')
             target_id = tdata.get('topic_id', '???')
+
             btn_display = f"{t_status} {t_title} ({tid}) ➡️ {target_id}"
+
             keyboard.append([
-                InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}"),
-                InlineKeyboardButton("❌", callback_data=f"del_{cid}_{tid}")
+                InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}")
+            ])
+            keyboard.append([
+                InlineKeyboardButton(
+                    "⏸ ОТКЛЮЧИТЬ ВЕТКУ" if t_enabled else "🟢 ВКЛЮЧИТЬ ВЕТКУ",
+                    callback_data=f"tgt_{cid}_{tid}"
+                ),
+                InlineKeyboardButton("❌ УДАЛИТЬ", callback_data=f"del_{cid}_{tid}")
             ])
 
     back_target = "list_privates" if is_private else "list_groups"
@@ -225,6 +234,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del db[cid]['topics'][tid]
             TopicManager.save_db(db)
             await show_manage_menu(query, cid, db)
+    
+    elif data.startswith("tgt_"):
+        _, cid, tid = data.split("_")
+
+        if cid in db and tid in db[cid].get('topics', {}):
+            current = db[cid]['topics'][tid].get('enabled', True)
+            db[cid]['topics'][tid]['enabled'] = not current
+            TopicManager.save_db(db)
+
+        await show_manage_menu(query, cid, db)
             
     elif data == "main_menu": await cmd_list(update, context)
 
