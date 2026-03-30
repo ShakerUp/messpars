@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
 from telethon.tl.types import (
-    User, Chat, Channel, MessageActionTopicCreate, 
+    User, Chat, Channel, MessageActionTopicCreate,
     MessageMediaPhoto, MessageMediaDocument
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -40,17 +40,17 @@ API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DEFAULT_TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
-ADMIN_ID = 684460638  
+ADMIN_ID = 684460638
 
 TOPICS_DB_FILE = 'topics_mapping.json'
 DB_FILE = 'bot_data.db'
-MAX_FILE_SIZE = 50 * 1024 * 1024 
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
 # ====== USER COLOR SYSTEM ======
 
 USER_MARKERS = [
-    "🔴","🟠","🟡","🟢","🔵","🟣","🟤",
-    "🔹","🔸","🔺","🔻","🔷","🔶","💠"
+    "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤",
+    "🔹", "🔸", "🔺", "🔻", "🔷", "🔶", "💠"
 ]
 
 def get_user_marker(user_id: int):
@@ -74,27 +74,29 @@ class DB:
     @staticmethod
     def init():
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute('CREATE TABLE IF NOT EXISTS msg_map (src_id INTEGER PRIMARY KEY, tgt_id INTEGER, tid INTEGER, custom_target_id INTEGER)')
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS msg_map (src_id INTEGER PRIMARY KEY, tgt_id INTEGER, tid INTEGER, custom_target_id INTEGER)'
+            )
 
     @staticmethod
     def save(src_id, tgt_chat_id, tgt_id, tid):
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute(
                 '''
-                INSERT OR REPLACE INTO msg_map 
+                INSERT OR REPLACE INTO msg_map
                 (src_id, tgt_id, tid, custom_target_id)
                 VALUES (?, ?, ?, ?)
                 ''',
                 (src_id, tgt_id, tid, tgt_chat_id)
             )
-            
+
     @staticmethod
     def get(src_id):
         with sqlite3.connect(DB_FILE) as conn:
             r = conn.execute(
                 '''
-                SELECT tgt_id, tid, custom_target_id 
-                FROM msg_map 
+                SELECT tgt_id, tid, custom_target_id
+                FROM msg_map
                 WHERE src_id = ?
                 ''',
                 (src_id,)
@@ -112,10 +114,13 @@ class DB:
 class TopicManager:
     @staticmethod
     def load_db():
-        if not os.path.exists(TOPICS_DB_FILE): return {}
+        if not os.path.exists(TOPICS_DB_FILE):
+            return {}
         try:
-            with open(TOPICS_DB_FILE, 'r', encoding='utf-8') as f: return json.load(f)
-        except: return {}
+            with open(TOPICS_DB_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
 
     @staticmethod
     def save_db(db):
@@ -154,14 +159,27 @@ class TopicManager:
     def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
         db = TopicManager.load_db()
         c_key, t_key = str(chat_id), str(s_tid or 0)
+
         if c_key not in db:
             default_enabled = False if chat_type == "private" else True
-            db[c_key] = {"title": title, "type": chat_type, "enabled": default_enabled, "custom_target_id": None, "topics": {}}
-        
+            db[c_key] = {
+                "title": title,
+                "type": chat_type,
+                "enabled": default_enabled,
+                "custom_target_id": None,
+                "auto_create_topics": True,
+                "topics": {}
+            }
+
+        if "auto_create_topics" not in db[c_key]:
+            db[c_key]["auto_create_topics"] = True
+
         existing_topic = db[c_key]["topics"].get(t_key, {})
         db[c_key]["topics"][t_key] = {
             "topic_id": target_tid or existing_topic.get('topic_id'),
-            "title": s_tname or existing_topic.get('title') or ("Личка" if chat_type == "private" else (f"Thread {t_key}" if t_key != "0" else "Main")),
+            "title": s_tname or existing_topic.get('title') or (
+                "Личка" if chat_type == "private" else (f"Thread {t_key}" if t_key != "0" else "Main")
+            ),
             "enabled": existing_topic.get('enabled', True)
         }
         TopicManager.save_db(db)
@@ -169,20 +187,34 @@ class TopicManager:
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 async def show_manage_menu(query, cid, db):
     cdata = db.get(str(cid))
-    if not cdata: return
+    if not cdata:
+        return
+
     is_private = cdata.get('type') == 'private'
     custom_target = cdata.get('custom_target_id') or "По умолчанию (из .env)"
-    
+    auto_create_topics = cdata.get('auto_create_topics', True)
+
     text = f"⚙️ **Управление:** {cdata['title']} (`{cid}`)\n\n"
     text += f"Статус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}\n"
-    text += f"🎯 Куда шлем: `{custom_target}`\n\n"
+    text += f"🎯 Куда шлем: `{custom_target}`\n"
+    text += f"🆕 Автосоздание топиков: {'✅ ВКЛ' if auto_create_topics else '⛔ ВЫКЛ'}\n\n"
     text += "🔍 `[Статус] Имя (ID источника) ➡️ ID топика`"
-    
+
     keyboard = [
-        [InlineKeyboardButton(f"{'🔴 ВЫКЛЮЧИТЬ ЧАТ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ ЧАТ'}", callback_data=f"tgc_{cid}")],
-        [InlineKeyboardButton("🎯 ИЗМЕНИТЬ КАНАЛ НАЗНАЧЕНИЯ", callback_data=f"editchat_{cid}")]
+        [InlineKeyboardButton(
+            f"{'🔴 ВЫКЛЮЧИТЬ ЧАТ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ ЧАТ'}",
+            callback_data=f"tgc_{cid}"
+        )],
+        [InlineKeyboardButton(
+            "🎯 ИЗМЕНИТЬ КАНАЛ НАЗНАЧЕНИЯ",
+            callback_data=f"editchat_{cid}"
+        )],
+        [InlineKeyboardButton(
+            "⛔ НЕ СОЗДАВАТЬ НОВЫЕ ТОПИКИ" if auto_create_topics else "✅ РАЗРЕШИТЬ СОЗДАНИЕ ТОПИКОВ",
+            callback_data=f"tat_{cid}"
+        )]
     ]
-    
+
     if not is_private:
         keyboard.append([InlineKeyboardButton("--- Настройка веток ---", callback_data="none")])
         for tid, tdata in cdata.get('topics', {}).items():
@@ -206,54 +238,104 @@ async def show_manage_menu(query, cid, db):
 
     back_target = "list_privates" if is_private else "list_groups"
     keyboard.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_target)])
-    
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    keyboard = [[InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")], 
-                [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]]
+    if update.effective_user.id != ADMIN_ID:
+        return
+    keyboard = [
+        [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
+        [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]
+    ]
     text = "📂 **Главное меню:**"
-    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID or query.data == "none": await query.answer(); return
-    await query.answer(); db = TopicManager.load_db(); data = query.data
+    if query.from_user.id != ADMIN_ID or query.data == "none":
+        await query.answer()
+        return
+
+    await query.answer()
+    db = TopicManager.load_db()
+    data = query.data
 
     if data in ["list_groups", "list_privates"]:
         target_priv = (data == "list_privates")
-        kb = [[InlineKeyboardButton(f"{'✅' if d['enabled'] else '⏸'} {d['title']}", callback_data=f"manage_{cid}")] 
-              for cid, d in db.items() if (d.get('type') == 'private') == target_priv]
+        kb = [
+            [InlineKeyboardButton(
+                f"{'✅' if d['enabled'] else '⏸'} {d['title']}",
+                callback_data=f"manage_{cid}"
+            )]
+            for cid, d in db.items()
+            if (d.get('type') == 'private') == target_priv
+        ]
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
-        await query.edit_message_text(f"📂 **Список: {'Лички' if target_priv else 'Группы'}**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    
-    elif data.startswith("manage_"): await show_manage_menu(query, data.split("_")[1], db)
-    
+        await query.edit_message_text(
+            f"📂 **Список: {'Лички' if target_priv else 'Группы'}**",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='Markdown'
+        )
+
+    elif data.startswith("manage_"):
+        await show_manage_menu(query, data.split("_", 1)[1], db)
+
     elif data.startswith("tgc_"):
-        cid = data.split("_")[1]; db[cid]['enabled'] = not db[cid]['enabled']; TopicManager.save_db(db)
+        cid = data.split("_", 1)[1]
+        db[cid]['enabled'] = not db[cid]['enabled']
+        TopicManager.save_db(db)
+        await show_manage_menu(query, cid, db)
+
+    elif data.startswith("tat_"):
+        cid = data.split("_", 1)[1]
+
+        if cid in db:
+            current = db[cid].get("auto_create_topics", True)
+            db[cid]["auto_create_topics"] = not current
+            TopicManager.save_db(db)
+
         await show_manage_menu(query, cid, db)
 
     elif data.startswith("editchat_"):
-        cid = data.split("_")[1]
+        cid = data.split("_", 1)[1]
         user_edit_state[query.from_user.id] = {"mode": "target_chat", "cid": cid}
-        await query.message.reply_text(f"📝 Введите **ID нового канала**, куда пересылать сообщения из этого источника.\nЧтобы вернуть стандартный канал, введите `0`.")
+        await query.message.reply_text(
+            "📝 Введите **ID нового канала**, куда пересылать сообщения из этого источника.\n"
+            "Чтобы вернуть стандартный канал, введите `0`."
+        )
 
     elif data.startswith("editid_"):
-        _, cid, tid = data.split("_")
+        _, cid, tid = data.split("_", 2)
         user_edit_state[query.from_user.id] = {"mode": "topic_id", "cid": cid, "tid": tid}
-        await query.message.reply_text(f"📝 Введите новый **Target ID** (ID топика) для ветки `{tid}`:")
+        await query.message.reply_text(
+            f"📝 Введите новый **Target ID** (ID топика) для ветки `{tid}`:"
+        )
 
     elif data.startswith("del_"):
-        _, cid, tid = data.split("_")
+        _, cid, tid = data.split("_", 2)
         if cid in db and tid in db[cid].get('topics', {}):
             del db[cid]['topics'][tid]
             TopicManager.save_db(db)
             await show_manage_menu(query, cid, db)
-    
+
     elif data.startswith("tgt_"):
-        _, cid, tid = data.split("_")
+        _, cid, tid = data.split("_", 2)
 
         if cid in db and tid in db[cid].get('topics', {}):
             current = db[cid]['topics'][tid].get('enabled', True)
@@ -261,12 +343,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             TopicManager.save_db(db)
 
         await show_manage_menu(query, cid, db)
-            
-    elif data == "main_menu": await cmd_list(update, context)
+
+    elif data == "main_menu":
+        await cmd_list(update, context)
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id != ADMIN_ID or user_id not in user_edit_state: return
+    if user_id != ADMIN_ID or user_id not in user_edit_state:
+        return
 
     state = user_edit_state.pop(user_id)
     new_input = update.message.text.strip()
@@ -284,7 +368,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 await update.message.reply_text("❌ Ошибка: Введите корректный ID (число).")
                 return
-    
+
     elif state["mode"] == "topic_id":
         tid = state["tid"]
         if new_input.isdigit():
@@ -307,11 +391,11 @@ class ForumManager:
             tid = res.message_thread_id
             logger.info(f"[FORUM] Создан новый топик '{name}' ID: {tid} в чате {target_chat}")
             return tid
-        except Exception as e: 
+        except Exception as e:
             logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
             return None
 
-def resolve_source_topic_id(msg, chat_conf=None) -> int:
+def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
     if getattr(msg, 'message_thread_id', None):
         return int(msg.message_thread_id)
 
@@ -325,7 +409,13 @@ def resolve_source_topic_id(msg, chat_conf=None) -> int:
     if getattr(reply_to, 'reply_to_msg_id', None):
         candidate = int(reply_to.reply_to_msg_id)
         known_topics = (chat_conf or {}).get('topics', {})
+
+        # Если topic уже известен для этого source-чата
         if str(candidate) in known_topics:
+            return candidate
+
+        # Для forum-channel обычное сообщение в ветке часто выглядит именно так
+        if isinstance(chat, Channel) and getattr(chat, 'forum', False):
             return candidate
 
     return 0
@@ -337,7 +427,7 @@ async def telethon_handler(event):
 
     chat = await event.get_chat()
     sender = await event.get_sender()
-    
+
     log_full_message(event, tag="NEW")
 
     chat_title = getattr(chat, 'title', getattr(chat, 'first_name', 'Unknown'))
@@ -347,32 +437,32 @@ async def telethon_handler(event):
     db_data = TopicManager.load_db()
     chat_id_str = str(chat.id)
     chat_conf = db_data.get(chat_id_str, {})
+    auto_create_topics = chat_conf.get("auto_create_topics", True)
 
     final_target_chat = chat_conf.get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
 
-  # =====================================================
-  # 👤 ИМЯ + ЦВЕТ ОТПРАВИТЕЛЯ
-  # =====================================================
-
+    # =====================================================
+    # 👤 ИМЯ + ЦВЕТ ОТПРАВИТЕЛЯ
+    # =====================================================
     sender_id = getattr(sender, "id", None)
 
     if isinstance(chat, Channel) and getattr(chat, 'broadcast', False):
-      sender_name = chat_title
+        sender_name = chat_title
     elif isinstance(sender, User):
-      first = sender.first_name or ""
-      last = sender.last_name or ""
-      sender_name = (first + " " + last).strip() or sender.username or "Unknown"
+        first = sender.first_name or ""
+        last = sender.last_name or ""
+        sender_name = (first + " " + last).strip() or sender.username or "Unknown"
     else:
-      sender_name = chat_title
+        sender_name = chat_title
 
     user_marker = get_user_marker(sender_id)
 
-# =====================================================
-    # 🔥 ИСПРАВЛЕННАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ ТОПИКА
     # =====================================================
-    source_top_id = resolve_source_topic_id(msg, chat_conf)
+    # 🔥 ЛОГИКА ОПРЕДЕЛЕНИЯ ТОПИКА
+    # =====================================================
+    source_top_id = resolve_source_topic_id(msg, chat, chat_conf)
 
-    # Логика для маппинга ответов (остается без изменений)
+    # Логика для маппинга ответов
     reply_to_target_id = None
     reply_mapping = None
 
@@ -399,8 +489,10 @@ async def telethon_handler(event):
         f"reply_to_top_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_top_id', None)}, "
         f"reply_to_msg_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_msg_id', None)}"
     )
+
     status = TopicManager.get_status(chat.id, source_top_id)
     if status == "paused":
+        logger.info(f"[SKIP] Message {msg.id} skipped because topic {source_top_id} is disabled")
         return
 
     # =====================================================
@@ -436,17 +528,17 @@ async def telethon_handler(event):
     # =====================================================
     original_text = msg.message or ""
     if DISPLAY_MODE == "compact":
-      prefixed_text = (
-          f"{user_marker} <b>{sender_name}:</b>\n{original_text}"
-          if original_text
-          else f"{user_marker} <b>{sender_name}:</b>"
-      )
-    else:  # classic
-      prefixed_text = (
-          f"{user_marker} <b>{sender_name}</b>\n{original_text}"
-          if original_text
-          else f"{user_marker} <b>{sender_name}</b>"
-      )
+        prefixed_text = (
+            f"{user_marker} <b>{sender_name}:</b>\n{original_text}"
+            if original_text
+            else f"{user_marker} <b>{sender_name}:</b>"
+        )
+    else:
+        prefixed_text = (
+            f"{user_marker} <b>{sender_name}</b>\n{original_text}"
+            if original_text
+            else f"{user_marker} <b>{sender_name}</b>"
+        )
 
     # =====================================================
     # 5. ОТПРАВКА
@@ -458,6 +550,22 @@ async def telethon_handler(event):
         if not target_tid:
             if status == "new" and is_private:
                 TopicManager.register_source(chat.id, chat_title, "private", 0)
+                return
+
+            # Для reply-кейсов без явного source topic не создаем мусорный новый топик
+            if msg.reply_to and source_top_id == 0:
+                logger.info(
+                    f"[SKIP REPLY AUTO CREATE] chat={chat.id}, msg={msg.id}, "
+                    f"reply_to_msg_id={getattr(msg.reply_to, 'reply_to_msg_id', None)} "
+                    f"— reply без явного source topic, новый топик не создаем"
+                )
+                return
+
+            if not auto_create_topics:
+                logger.info(
+                    f"[SKIP AUTO CREATE] chat={chat.id}, title={chat_title}, "
+                    f"source_topic={source_top_id} — автосоздание топиков выключено"
+                )
                 return
 
             logger.info(f"[AUTO] Создаю новый топик для {chat_title} (Source Topic: {source_top_id})...")
@@ -515,15 +623,17 @@ async def telethon_handler(event):
                     **send_kwargs
                 )
 
-            # Сохраняем маппинг с правильным source_top_id
             DB.save(
-              msg.id,
-              final_target_chat,
-              sent.message_id,
-              int(target_tid)
-          )
+                msg.id,
+                final_target_chat,
+                sent.message_id,
+                int(target_tid)
+            )
 
-            logger.info(f"[SUCCESS] Msg {msg.id} (Source Topic:{source_top_id}) ➡️ Target Msg {sent.message_id} (Target Topic:{target_tid})")
+            logger.info(
+                f"[SUCCESS] Msg {msg.id} (Source Topic:{source_top_id}) ➡️ "
+                f"Target Msg {sent.message_id} (Target Topic:{target_tid})"
+            )
             success = True
             break
 
@@ -662,14 +772,14 @@ async def main():
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
-    
+
     await bot_app.initialize()
     await bot_app.start()
 
     client = TelegramClient('support_session', API_ID, API_HASH)
     client.add_event_handler(telethon_handler, events.NewMessage())
     client.add_event_handler(telethon_edit_handler, events.MessageEdited())
-    
+
     await client.start()
     logger.info("🚀 Бот запущен. Исправлена логика топиков и редактирования.")
 
