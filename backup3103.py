@@ -3,15 +3,12 @@ import os
 import sys
 import json
 import io
-import re
 import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
-from html import escape
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
-from telethon.extensions import html as telethon_html
 from telethon.tl.types import (
     User, Chat, Channel, MessageActionTopicCreate,
     MessageMediaPhoto, MessageMediaDocument
@@ -49,11 +46,6 @@ TOPICS_DB_FILE = 'topics_mapping.json'
 DB_FILE = 'bot_data.db'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-LOG_FILE = "bot_messages.log"
-LOG_RETENTION_DAYS = 2
-LOG_EXPORT_HOURS = 24
-KYIV_OFFSET = 3
-
 # ====== USER COLOR SYSTEM ======
 
 USER_MARKERS = [
@@ -76,137 +68,6 @@ bot_app = None
 
 SYSTEM_IDS = [777000, 1000, 1087968824]
 EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), DEFAULT_TARGET_CHAT_ID] + SYSTEM_IDS
-
-# ====== STYLE + LOG HELPERS ======
-
-def get_now_kyiv():
-    return datetime.now(timezone.utc) + timedelta(hours=KYIV_OFFSET)
-
-def render_message_html(msg) -> str:
-    """
-    Возвращает текст сообщения в HTML с сохранением оригинальных стилей Telethon:
-    bold, italic, code, pre, text links, underline, strike, spoiler и т.п.
-    """
-    try:
-        text = msg.message or ""
-        entities = getattr(msg, "entities", None) or []
-        if not text:
-            return ""
-        return telethon_html.unparse(text, entities)
-    except Exception as e:
-        logger.warning(f"[STYLE ERROR] Не удалось распарсить entities: {e}")
-        return escape(msg.message or "")
-
-def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -> str:
-    """
-    Собирает итоговый HTML:
-    - наш префикс
-    - оригинальный текст со стилями
-    - пометка редактирования (если edited=True)
-    """
-    original_html = render_message_html(msg)
-
-    safe_sender = escape(sender_name or "Unknown")
-    safe_marker = escape(user_marker or "🔹")
-
-    if DISPLAY_MODE == "compact":
-        header = f"{safe_marker} <b>{safe_sender}:</b>"
-    else:
-        header = f"{safe_marker} <b>{safe_sender}</b>"
-
-    if original_html:
-        if DISPLAY_MODE == "compact":
-            result = f"{header}\n{original_html}"
-        else:
-            result = f"{header}\n{original_html}"
-    else:
-        result = header
-
-    if edited:
-        edit_time = get_now_kyiv().strftime('%H:%M')
-        result += f"\n\n<i>(ред. {edit_time})</i>"
-
-    return result
-
-def parse_log_timestamp(line: str):
-    """
-    Парсит timestamp в начале строки лога:
-    2026-03-31 21:14:15,123 | ...
-    """
-    m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\s\|", line)
-    if not m:
-        return None
-    try:
-        return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-def prune_old_logs():
-    """
-    Оставляет в основном лог-файле только записи за последние 2 суток.
-    """
-    if not os.path.exists(LOG_FILE):
-        return
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=LOG_RETENTION_DAYS)
-
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        kept = []
-        keep_current_block = False
-
-        for line in lines:
-            ts = parse_log_timestamp(line)
-            if ts is not None:
-                keep_current_block = ts >= cutoff
-
-            if keep_current_block:
-                kept.append(line)
-
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.writelines(kept)
-
-    except Exception as e:
-        logger.error(f"[LOG PRUNE ERROR] {e}")
-
-def collect_recent_logs(hours=LOG_EXPORT_HOURS) -> str:
-    """
-    Собирает логи за последние N часов во временный файл и возвращает путь.
-    """
-    if not os.path.exists(LOG_FILE):
-        return None
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    output_path = f"logs_last_{hours}h.txt"
-
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        selected = []
-        keep_current_block = False
-
-        for line in lines:
-            ts = parse_log_timestamp(line)
-            if ts is not None:
-                keep_current_block = ts >= cutoff
-
-            if keep_current_block:
-                selected.append(line)
-
-        if not selected:
-            selected = ["За последние 24 часа записей нет.\n"]
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.writelines(selected)
-
-        return output_path
-
-    except Exception as e:
-        logger.error(f"[LOG EXPORT ERROR] {e}")
-        return None
 
 # ====== DATABASE ======
 class DB:
@@ -404,34 +265,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-        
-async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    prune_old_logs()
-    log_path = collect_recent_logs(LOG_EXPORT_HOURS)
-
-    if not log_path or not os.path.exists(log_path):
-        await update.message.reply_text("❌ Не удалось собрать лог за последние 24 часа.")
-        return
-
-    try:
-        with open(log_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=os.path.basename(log_path),
-                caption="🧾 Логи за последние 24 часа"
-            )
-    except Exception as e:
-        logger.error(f"[CMD /log ERROR] {e}")
-        await update.message.reply_text(f"❌ Ошибка отправки логов: {e}")
-    finally:
-        try:
-            if os.path.exists(log_path):
-                os.remove(log_path)
-        except Exception:
-            pass
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -693,7 +526,19 @@ async def telethon_handler(event):
     # =====================================================
     # 4. ФОРМИРУЕМ ТЕКСТ
     # =====================================================
-    prefixed_text = build_prefixed_html(sender_name, user_marker, msg, edited=False)
+    original_text = msg.message or ""
+    if DISPLAY_MODE == "compact":
+        prefixed_text = (
+            f"{user_marker} <b>{sender_name}:</b>\n{original_text}"
+            if original_text
+            else f"{user_marker} <b>{sender_name}:</b>"
+        )
+    else:
+        prefixed_text = (
+            f"{user_marker} <b>{sender_name}</b>\n{original_text}"
+            if original_text
+            else f"{user_marker} <b>{sender_name}</b>"
+        )
 
     # =====================================================
     # 5. ОТПРАВКА
@@ -848,7 +693,20 @@ async def telethon_edit_handler(event):
         user_marker = get_user_marker(sender_id)
 
         # ===== Новый текст =====
-        updated_text = build_prefixed_html(sender_name, user_marker, msg, edited=True)
+        original_text = msg.text or ""
+        edit_time = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')
+
+        if DISPLAY_MODE == "compact":
+            updated_text = (
+                f"{user_marker} <b>{sender_name}:</b> {original_text}\n\n"
+                f"<i>(ред. {edit_time})</i>"
+            )
+        else:
+            updated_text = (
+                f"{user_marker} <b>{sender_name}</b>\n"
+                f"{original_text}\n\n"
+                f"<i>(ред. {edit_time})</i>"
+            )
 
         logger.info(f"[EDIT] Обновляю сообщение {rel['tgt_id']}")
 
@@ -910,11 +768,8 @@ def log_full_message(event, tag="NEW"):
 async def main():
     global client, bot_app
     DB.init()
-    prune_old_logs()
-
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("list", cmd_list))
-    bot_app.add_handler(CommandHandler("log", cmd_log))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
