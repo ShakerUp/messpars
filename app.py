@@ -5,12 +5,10 @@ import json
 import io
 import sqlite3
 import logging
-from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
-from telethon.extensions import html as telethon_html
 from telethon.tl.types import (
     User, Chat, Channel, MessageActionTopicCreate,
     MessageMediaPhoto, MessageMediaDocument
@@ -19,27 +17,14 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
-LOG_FILE = "bot_messages.log"
-
-log_formatter = logging.Formatter('%(asctime)s | %(message)s')
-
-file_handler = TimedRotatingFileHandler(
-    LOG_FILE,
-    when="midnight",
-    interval=1,
-    backupCount=1,
-    encoding="utf-8"
-)
-file_handler.setFormatter(log_formatter)
-
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(log_formatter)
-
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[file_handler, stream_handler]
+    format='%(asctime)s | %(message)s',
+    handlers=[
+        logging.FileHandler("bot_messages.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
-
 logger = logging.getLogger(__name__)
 
 user_edit_state = {}
@@ -281,49 +266,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers:
-        try:
-            handler.flush()
-        except Exception:
-            pass
-
-    files_to_send = []
-
-    if os.path.exists(LOG_FILE):
-        files_to_send.append(LOG_FILE)
-
-    for fname in sorted(os.listdir(".")):
-        if fname.startswith(LOG_FILE + "."):
-            files_to_send.append(fname)
-
-    if not files_to_send:
-        if update.message:
-            await update.message.reply_text("❌ Логи не найдены.")
-        return
-
-    sent_any = False
-    target_message = update.message
-
-    for path in files_to_send:
-        try:
-            with open(path, "rb") as f:
-                await target_message.reply_document(
-                    document=f,
-                    filename=os.path.basename(path),
-                    caption=f"📄 Лог: {os.path.basename(path)}"
-                )
-            sent_any = True
-        except Exception as e:
-            logger.error(f"[LOG SEND ERROR] {path}: {e}")
-
-    if not sent_any:
-        await target_message.reply_text("❌ Не удалось отправить лог-файлы.")
-
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID or query.data == "none":
@@ -454,47 +396,29 @@ class ForumManager:
             return None
 
 def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
-    if getattr(msg, "message_thread_id", None):
+    if getattr(msg, 'message_thread_id', None):
         return int(msg.message_thread_id)
 
-    reply_to = getattr(msg, "reply_to", None)
+    reply_to = getattr(msg, 'reply_to', None)
+    if not reply_to:
+        return 0
 
-    if reply_to and getattr(reply_to, "reply_to_top_id", None):
+    if getattr(reply_to, 'reply_to_top_id', None):
         return int(reply_to.reply_to_top_id)
 
-    # Во всех остальных случаях считаем Main
+    if getattr(reply_to, 'reply_to_msg_id', None):
+        candidate = int(reply_to.reply_to_msg_id)
+        known_topics = (chat_conf or {}).get('topics', {})
+
+        # Если topic уже известен для этого source-чата
+        if str(candidate) in known_topics:
+            return candidate
+
+        # Для forum-channel обычное сообщение в ветке часто выглядит именно так
+        if isinstance(chat, Channel) and getattr(chat, 'forum', False):
+            return candidate
+
     return 0
-
-def build_html_text(msg, sender_name: str, user_marker: str, is_edit: bool = False) -> str:
-    raw_text = msg.message or ""
-
-    if raw_text and getattr(msg, "entities", None):
-        try:
-            original_html = telethon_html.unparse(raw_text, msg.entities)
-        except Exception as e:
-            logger.warning(f"[HTML UNPARSE ERROR] {e}")
-            original_html = raw_text
-    else:
-        original_html = raw_text
-
-    if DISPLAY_MODE == "compact":
-        base = (
-            f"{user_marker} <b>{sender_name}:</b>\n{original_html}"
-            if original_html
-            else f"{user_marker} <b>{sender_name}:</b>"
-        )
-    else:
-        base = (
-            f"{user_marker} <b>{sender_name}</b>\n{original_html}"
-            if original_html
-            else f"{user_marker} <b>{sender_name}</b>"
-        )
-
-    if is_edit:
-        edit_time = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')
-        base += f"\n\n<i>(ред. {edit_time})</i>"
-
-    return base
 
 async def telethon_handler(event):
     msg = event.message
@@ -546,11 +470,6 @@ async def telethon_handler(event):
         reply_mapping = DB.get(msg.reply_to.reply_to_msg_id)
         if reply_mapping:
             reply_to_target_id = reply_mapping['tgt_id']
-
-    logger.info(
-        f"[REPLY MAP] src_reply_id={getattr(msg.reply_to, 'reply_to_msg_id', None) if msg.reply_to else None} "
-        f"reply_mapping={reply_mapping}"
-    )
 
     # =====================================================
     # 2. ИЩЕМ ЦЕЛЕВОЙ ТОПИК
@@ -607,7 +526,19 @@ async def telethon_handler(event):
     # =====================================================
     # 4. ФОРМИРУЕМ ТЕКСТ
     # =====================================================
-    prefixed_text = build_html_text(msg, sender_name, user_marker, is_edit=False)
+    original_text = msg.message or ""
+    if DISPLAY_MODE == "compact":
+        prefixed_text = (
+            f"{user_marker} <b>{sender_name}:</b>\n{original_text}"
+            if original_text
+            else f"{user_marker} <b>{sender_name}:</b>"
+        )
+    else:
+        prefixed_text = (
+            f"{user_marker} <b>{sender_name}</b>\n{original_text}"
+            if original_text
+            else f"{user_marker} <b>{sender_name}</b>"
+        )
 
     # =====================================================
     # 5. ОТПРАВКА
@@ -664,12 +595,6 @@ async def telethon_handler(event):
                 "message_thread_id": int(target_tid),
                 "reply_to_message_id": current_reply_id
             }
-
-            logger.info(
-                f"[SEND ATTEMPT] msg={msg.id}, chat={chat.id}, "
-                f"target_chat={final_target_chat}, target_tid={target_tid}, "
-                f"reply_to_target_id={current_reply_id}, has_media={bool(msg.media)}"
-            )
 
             if msg.media:
                 send_kwargs["parse_mode"] = "HTML"
@@ -768,7 +693,20 @@ async def telethon_edit_handler(event):
         user_marker = get_user_marker(sender_id)
 
         # ===== Новый текст =====
-        updated_text = build_html_text(msg, sender_name, user_marker, is_edit=True)
+        original_text = msg.text or ""
+        edit_time = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M')
+
+        if DISPLAY_MODE == "compact":
+            updated_text = (
+                f"{user_marker} <b>{sender_name}:</b> {original_text}\n\n"
+                f"<i>(ред. {edit_time})</i>"
+            )
+        else:
+            updated_text = (
+                f"{user_marker} <b>{sender_name}</b>\n"
+                f"{original_text}\n\n"
+                f"<i>(ред. {edit_time})</i>"
+            )
 
         logger.info(f"[EDIT] Обновляю сообщение {rel['tgt_id']}")
 
@@ -819,7 +757,6 @@ def log_full_message(event, tag="NEW"):
             "media_type": type(msg.media).__name__ if msg.media else None,
             "file_name": getattr(msg.file, "name", None) if msg.media else None,
             "file_size": getattr(msg.file, "size", None) if msg.media else None,
-            "entities": [type(e).__name__ for e in msg.entities] if getattr(msg, "entities", None) else None,
         }
 
         logger.info("========== MESSAGE LOG ==========")
@@ -833,7 +770,6 @@ async def main():
     DB.init()
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("list", cmd_list))
-    bot_app.add_handler(CommandHandler("log", cmd_log))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
