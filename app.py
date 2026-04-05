@@ -432,6 +432,84 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(log_path)
         except Exception:
             pass
+          
+async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/bindtopic <source_chat_id> <source_topic_id> <target_topic_id>\n\n"
+            "Пример:\n"
+            "/bindtopic -1001234567890 17 2456"
+        )
+        return
+
+    try:
+        source_chat_id = int(context.args[0])
+        source_topic_id = int(context.args[1])
+        target_topic_id = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Все аргументы должны быть числами.")
+        return
+
+    if source_topic_id <= 0:
+        await update.message.reply_text("❌ source_topic_id должен быть больше 0.")
+        return
+
+    if target_topic_id <= 0:
+        await update.message.reply_text("❌ target_topic_id должен быть больше 0.")
+        return
+
+    try:
+        db = TopicManager.load_db()
+        c_key = str(source_chat_id)
+        t_key = str(source_topic_id)
+
+        # если чат уже известен — ничего важного не трогаем
+        if c_key not in db:
+            db[c_key] = {
+                "title": f"ManualBind {source_chat_id}",
+                "type": "channel",
+                "enabled": True,
+                "custom_target_id": None,
+                "auto_create_topics": True,
+                "topics": {}
+            }
+
+        if "topics" not in db[c_key]:
+            db[c_key]["topics"] = {}
+
+        if "auto_create_topics" not in db[c_key]:
+            db[c_key]["auto_create_topics"] = True
+
+        existing_topic = db[c_key]["topics"].get(t_key, {})
+
+        db[c_key]["topics"][t_key] = {
+            "topic_id": target_topic_id,
+            "title": existing_topic.get("title") or f"Thread {source_topic_id}",
+            "enabled": existing_topic.get("enabled", True)
+        }
+
+        TopicManager.save_db(db)
+
+        logger.info(
+            f"[MANUAL BIND] source_chat_id={source_chat_id}, "
+            f"source_topic_id={source_topic_id}, target_topic_id={target_topic_id}"
+        )
+
+        await update.message.reply_text(
+            "✅ Маппинг ветки сохранён.\n"
+            f"source_chat_id = `{source_chat_id}`\n"
+            f"source_topic_id = `{source_topic_id}`\n"
+            f"target_topic_id = `{target_topic_id}`",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"[BINDTOPIC ERROR] {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -915,6 +993,7 @@ async def main():
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CommandHandler("log", cmd_log))
+    bot_app.add_handler(CommandHandler("bindtopic", cmd_bindtopic))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
