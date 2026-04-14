@@ -408,12 +408,22 @@ async def show_manage_menu(query, cid, db):
     is_private = cdata.get('type') == 'private'
     custom_target = cdata.get('custom_target_id') or "По умолчанию (из .env)"
     auto_create_topics = cdata.get('auto_create_topics', True)
+    
+    safe_title = escape(str(cdata.get('title', 'Без названия')))
+    safe_cid = escape(str(cid))
+    safe_custom_target = escape(str(custom_target))
 
-    text = f"⚙️ **Управление:** {cdata['title']} (`{cid}`)\n\n"
-    text += f"Статус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}\n"
-    text += f"🎯 Куда шлем: `{custom_target}`\n"
+    text = f"⚙️ <b>Управление:</b> {safe_title} (<code>{safe_cid}</code>)\n\n"
+    text += f"Статус: {'✅ ВКЛ' if cdata.get('enabled', True) else '⏸ ПАУЗА'}\n"
+    text += f"🎯 Куда шлем: <code>{safe_custom_target}</code>\n"
     text += f"🆕 Автосоздание топиков: {'✅ ВКЛ' if auto_create_topics else '⛔ ВЫКЛ'}\n\n"
-    text += "🔍 `[Статус] Имя (ID источника) ➡️ ID топика`"
+    text += "🔍 <code>[Статус] Имя (ID источника) ➡️ ID топика</code>"
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
 
     keyboard = [
         [InlineKeyboardButton(
@@ -637,7 +647,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_sources_page(query, db, target_priv=True, page=page)
 
     elif data.startswith("manage_"):
-        await show_manage_menu(query, data.split("_", 1)[1], db)
+    cid = data.split("_", 1)[1]
+    logger.info(f"[MANAGE CLICK] raw_data={repr(data)} parsed_cid={cid}")
+
+    try:
+        await show_manage_menu(query, cid, db)
+        logger.info(f"[MANAGE CLICK SUCCESS] cid={cid}")
+    except Exception as e:
+        logger.exception(f"[MANAGE CLICK ERROR] cid={cid} error={e}")
+        try:
+            await query.message.reply_text(f"❌ Ошибка открытия меню для cid={cid}: {e}")
+        except Exception:
+            pass
 
     elif data.startswith("tgc_"):
         cid = data.split("_", 1)[1]
