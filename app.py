@@ -39,6 +39,8 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 # ====== КОНФИГУРАЦИЯ ======
 load_dotenv()
 
+LIST_PAGE_SIZE = 10
+
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -322,6 +324,72 @@ class TopicManager:
             "enabled": existing_topic.get('enabled', True)
         }
         TopicManager.save_db(db)
+        
+async def show_sources_page(query, db, target_priv: bool, page: int = 0):
+    items = [
+        (cid, d)
+        for cid, d in db.items()
+        if (d.get('type') == 'private') == target_priv
+    ]
+
+    # Чтобы список был стабильный и не прыгал
+    items.sort(key=lambda x: x[1].get('title', '').lower())
+
+    total = len(items)
+    total_pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+
+    start = page * LIST_PAGE_SIZE
+    end = start + LIST_PAGE_SIZE
+    page_items = items[start:end]
+
+    kb = []
+    for cid, d in page_items:
+        kb.append([
+            InlineKeyboardButton(
+                f"{'✅' if d.get('enabled', True) else '⏸'} {d.get('title', 'Без названия')}",
+                callback_data=f"manage_{cid}"
+            )
+        ])
+
+    nav_row = []
+    prefix = "priv" if target_priv else "grp"
+
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{prefix}_{page-1}")
+        )
+
+    nav_row.append(
+        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="none")
+    )
+
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton("Вперёд ➡️", callback_data=f"page_{prefix}_{page+1}")
+        )
+
+    if nav_row:
+        kb.append(nav_row)
+
+    kb.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="main_menu")])
+
+    title = "Лички" if target_priv else "Группы и каналы"
+    text = (
+        f"📂 **Список: {title}**\n\n"
+        f"Всего источников: {total}\n"
+        f"Страница: {page + 1}/{total_pages}"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode='Markdown'
+    )
 
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 async def show_manage_menu(query, cid, db):
@@ -521,22 +589,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = TopicManager.load_db()
     data = query.data
 
-    if data in ["list_groups", "list_privates"]:
-        target_priv = (data == "list_privates")
-        kb = [
-            [InlineKeyboardButton(
-                f"{'✅' if d['enabled'] else '⏸'} {d['title']}",
-                callback_data=f"manage_{cid}"
-            )]
-            for cid, d in db.items()
-            if (d.get('type') == 'private') == target_priv
-        ]
-        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
-        await query.edit_message_text(
-            f"📂 **Список: {'Лички' if target_priv else 'Группы'}**",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='Markdown'
-        )
+    if data == "list_groups":
+        await show_sources_page(query, db, target_priv=False, page=0)
+
+    elif data == "list_privates":
+        await show_sources_page(query, db, target_priv=True, page=0)
+
+    elif data.startswith("page_"):
+        _, section, page_str = data.split("_", 2)
+
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 0
+
+        if section == "grp":
+            await show_sources_page(query, db, target_priv=False, page=page)
+        elif section == "priv":
+            await show_sources_page(query, db, target_priv=True, page=page)
 
     elif data.startswith("manage_"):
         await show_manage_menu(query, data.split("_", 1)[1], db)
