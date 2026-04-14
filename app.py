@@ -647,18 +647,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_sources_page(query, db, target_priv=True, page=page)
 
     elif data.startswith("manage_"):
-    cid = data.split("_", 1)[1]
-    logger.info(f"[MANAGE CLICK] raw_data={repr(data)} parsed_cid={cid}")
+        cid = data.split("_", 1)[1]
+        logger.info(f"[MANAGE CLICK] raw_data={repr(data)} parsed_cid={cid}")
 
-    try:
-        await show_manage_menu(query, cid, db)
-        logger.info(f"[MANAGE CLICK SUCCESS] cid={cid}")
-    except Exception as e:
-        logger.exception(f"[MANAGE CLICK ERROR] cid={cid} error={e}")
         try:
-            await query.message.reply_text(f"❌ Ошибка открытия меню для cid={cid}: {e}")
-        except Exception:
-            pass
+            await show_manage_menu(query, cid, db)
+            logger.info(f"[MANAGE CLICK SUCCESS] cid={cid}")
+         except Exception as e:
+            logger.exception(f"[MANAGE CLICK ERROR] cid={cid} error={e}")
+              try:
+                await query.message.reply_text(f"❌ Ошибка открытия меню для cid={cid}: {e}")
+              except Exception:
+                pass
 
     elif data.startswith("tgc_"):
         cid = data.split("_", 1)[1]
