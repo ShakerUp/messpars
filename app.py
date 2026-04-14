@@ -325,9 +325,25 @@ class TopicManager:
 
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 async def show_manage_menu(query, cid, db):
+    # Пытаемся найти ID как есть, а если не нашли - пробуем убрать -100
     cdata = db.get(str(cid))
     if not cdata:
+        alt_cid = str(cid).replace("-100", "")
+        cdata = db.get(alt_cid)
+        if cdata:
+            cid = alt_cid # фиксируем найденный ключ
+            
+    if not cdata:
+        # Если всё равно не нашли, пробуем наоборот добавить -100
+        alt_cid = f"-100{cid}" if not str(cid).startswith("-100") else cid
+        cdata = db.get(alt_cid)
+        if cdata:
+            cid = alt_cid
+            
+    if not cdata:
+        logger.warning(f"ID {cid} не найден в базе при попытке открыть меню")
         return
+    # ... остальной код функции
 
     is_private = cdata.get('type') == 'private'
     custom_target = cdata.get('custom_target_id') or "По умолчанию (из .env)"
