@@ -96,6 +96,14 @@ def render_message_html(msg) -> str:
     except Exception as e:
         logger.warning(f"[STYLE ERROR] Не удалось распарсить entities: {e}")
         return escape(msg.message or "")
+      
+def escape_md(text: str) -> str:
+    if text is None:
+        return ""
+    chars = r'_*[]()~`>#+-=|{}.!'
+    for ch in chars:
+        text = text.replace(ch, f'\\{ch}')
+    return text
 
 def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -> str:
     """
@@ -349,7 +357,9 @@ async def show_manage_menu(query, cid, db):
     custom_target = cdata.get('custom_target_id') or "По умолчанию (из .env)"
     auto_create_topics = cdata.get('auto_create_topics', True)
 
-    text = f"⚙️ **Управление:** {cdata['title']} (`{cid}`)\n\n"
+    safe_title = escape_md(cdata['title'])
+    text = f"⚙️ **Управление:** {safe_title} (`{cid}`)\n\n"
+    
     text += f"Статус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}\n"
     text += f"🎯 Куда шлем: `{custom_target}`\n"
     text += f"🆕 Автосоздание топиков: {'✅ ВКЛ' if auto_create_topics else '⛔ ВЫКЛ'}\n\n"
