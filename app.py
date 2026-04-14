@@ -39,8 +39,6 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 # ====== КОНФИГУРАЦИЯ ======
 load_dotenv()
 
-LIST_PAGE_SIZE = 10
-
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -324,80 +322,6 @@ class TopicManager:
             "enabled": existing_topic.get('enabled', True)
         }
         TopicManager.save_db(db)
-        
-async def show_sources_page(query, db, target_priv: bool, page: int = 0):
-    logger.info(
-        f"[SHOW SOURCES PAGE] target_priv={target_priv} page={page} db_items={len(db)}"
-      )
-    items = [
-        (cid, d)
-        for cid, d in db.items()
-        if (d.get('type') == 'private') == target_priv
-    ]
-
-    # Чтобы список был стабильный и не прыгал
-    items.sort(key=lambda x: x[1].get('title', '').lower())
-
-    total = len(items)
-    total_pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
-    
-    logger.info(
-        f"[SHOW SOURCES PAGE] filtered_items={len(items)} "
-        f"type={'privates' if target_priv else 'groups'}"
-      )
-
-    if page < 0:
-        page = 0
-    if page >= total_pages:
-        page = total_pages - 1
-
-    start = page * LIST_PAGE_SIZE
-    end = start + LIST_PAGE_SIZE
-    page_items = items[start:end]
-
-    kb = []
-    for cid, d in page_items:
-        kb.append([
-            InlineKeyboardButton(
-                f"{'✅' if d.get('enabled', True) else '⏸'} {d.get('title', 'Без названия')}",
-                callback_data=f"manage_{cid}"
-            )
-        ])
-
-    nav_row = []
-    prefix = "priv" if target_priv else "grp"
-
-    if page > 0:
-        nav_row.append(
-            InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{prefix}_{page-1}")
-        )
-
-    nav_row.append(
-        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="none")
-    )
-
-    if page < total_pages - 1:
-        nav_row.append(
-            InlineKeyboardButton("Вперёд ➡️", callback_data=f"page_{prefix}_{page+1}")
-        )
-
-    if nav_row:
-        kb.append(nav_row)
-
-    kb.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="main_menu")])
-
-    title = "Лички" if target_priv else "Группы и каналы"
-    text = (
-        f"📂 **Список: {title}**\n\n"
-        f"Всего источников: {total}\n"
-        f"Страница: {page + 1}/{total_pages}"
-    )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode='Markdown'
-    )
 
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 async def show_manage_menu(query, cid, db):
@@ -408,22 +332,12 @@ async def show_manage_menu(query, cid, db):
     is_private = cdata.get('type') == 'private'
     custom_target = cdata.get('custom_target_id') or "По умолчанию (из .env)"
     auto_create_topics = cdata.get('auto_create_topics', True)
-    
-    safe_title = escape(str(cdata.get('title', 'Без названия')))
-    safe_cid = escape(str(cid))
-    safe_custom_target = escape(str(custom_target))
 
-    text = f"⚙️ <b>Управление:</b> {safe_title} (<code>{safe_cid}</code>)\n\n"
-    text += f"Статус: {'✅ ВКЛ' if cdata.get('enabled', True) else '⏸ ПАУЗА'}\n"
-    text += f"🎯 Куда шлем: <code>{safe_custom_target}</code>\n"
+    text = f"⚙️ **Управление:** {cdata['title']} (`{cid}`)\n\n"
+    text += f"Статус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}\n"
+    text += f"🎯 Куда шлем: `{custom_target}`\n"
     text += f"🆕 Автосоздание топиков: {'✅ ВКЛ' if auto_create_topics else '⛔ ВЫКЛ'}\n\n"
-    text += "🔍 <code>[Статус] Имя (ID источника) ➡️ ID топика</code>"
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='HTML'
-    )
+    text += "🔍 `[Статус] Имя (ID источника) ➡️ ID топика`"
 
     keyboard = [
         [InlineKeyboardButton(
@@ -473,24 +387,18 @@ async def show_manage_menu(query, cid, db):
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     keyboard = [
         [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
         [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]
     ]
-
-    log_inline_keyboard("MAIN MENU /list", keyboard)
-
     text = "📂 **Главное меню:**"
     if update.callback_query:
-        logger.info(f"[CMD_LIST] opened from callback by user_id={update.effective_user.id}")
         await update.callback_query.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
     else:
-        logger.info(f"[CMD_LIST] opened from message by user_id={update.effective_user.id}")
         await update.message.reply_text(
             text,
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -605,21 +513,7 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
-    try:
-        logger.info(
-            f"[CALLBACK RECEIVED] from_user={getattr(query.from_user, 'id', None)} "
-            f"data={repr(getattr(query, 'data', None))} "
-            f"message_id={getattr(getattr(query, 'message', None), 'message_id', None)} "
-            f"chat_id={getattr(getattr(query, 'message', None), 'chat_id', None)}"
-        )
-    except Exception as e:
-        logger.error(f"[CALLBACK LOG ERROR] {e}")
-
     if query.from_user.id != ADMIN_ID or query.data == "none":
-        logger.info(
-            f"[CALLBACK IGNORED] user_id={query.from_user.id}, data={repr(query.data)}"
-        )
         await query.answer()
         return
 
@@ -627,29 +521,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = TopicManager.load_db()
     data = query.data
 
-    if data == "list_groups":
-        await show_sources_page(query, db, target_priv=False, page=0)
+    if data in ["list_groups", "list_privates"]:
+        target_priv = (data == "list_privates")
+        kb = [
+            [InlineKeyboardButton(
+                f"{'✅' if d['enabled'] else '⏸'} {d['title']}",
+                callback_data=f"manage_{cid}"
+            )]
+            for cid, d in db.items()
+            if (d.get('type') == 'private') == target_priv
+        ]
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+        await query.edit_message_text(
+            f"📂 **Список: {'Лички' if target_priv else 'Группы'}**",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='Markdown'
+        )
 
-    elif data == "list_privates":
-        await show_sources_page(query, db, target_priv=True, page=0)
+    elif data.startswith("manage_"):
+        await show_manage_menu(query, data.split("_", 1)[1], db)
 
-    elif data.startswith("page_"):
-        _, section, page_str = data.split("_", 2)
-
-        try:
-            page = int(page_str)
-        except ValueError:
-            page = 0
-
-        if section == "grp":
-            await show_sources_page(query, db, target_priv=False, page=page)
-        elif section == "priv":
-            await show_sources_page(query, db, target_priv=True, page=page)
-
-
-    elif data.startswith("manage_"): 
-      await show_manage_menu(query, data.split("_", 1)[1], db)
-      
     elif data.startswith("tgc_"):
         cid = data.split("_", 1)[1]
         db[cid]['enabled'] = not db[cid]['enabled']
@@ -700,28 +591,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "main_menu":
         await cmd_list(update, context)
-
-
-def log_inline_keyboard(prefix: str, keyboard):
-    try:
-        rows_data = []
-        for row_idx, row in enumerate(keyboard):
-            row_dump = []
-            for btn in row:
-                row_dump.append({
-                    "text": getattr(btn, "text", None),
-                    "callback_data": getattr(btn, "callback_data", None)
-                })
-            rows_data.append({
-                "row": row_idx,
-                "buttons": row_dump
-            })
-
-        logger.info(f"[INLINE KEYBOARD] {prefix}")
-        logger.info(json.dumps(rows_data, indent=2, ensure_ascii=False))
-    except Exception as e:
-        logger.error(f"[INLINE KEYBOARD LOG ERROR] {e}")
-
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
