@@ -326,6 +326,9 @@ class TopicManager:
         TopicManager.save_db(db)
         
 async def show_sources_page(query, db, target_priv: bool, page: int = 0):
+    logger.info(
+        f"[SHOW SOURCES PAGE] target_priv={target_priv} page={page} db_items={len(db)}"
+      )
     items = [
         (cid, d)
         for cid, d in db.items()
@@ -337,6 +340,11 @@ async def show_sources_page(query, db, target_priv: bool, page: int = 0):
 
     total = len(items)
     total_pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    
+    logger.info(
+        f"[SHOW SOURCES PAGE] filtered_items={len(items)} "
+        f"type={'privates' if target_priv else 'groups'}"
+      )
 
     if page < 0:
         page = 0
@@ -455,18 +463,24 @@ async def show_manage_menu(query, cid, db):
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+
     keyboard = [
         [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
         [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]
     ]
+
+    log_inline_keyboard("MAIN MENU /list", keyboard)
+
     text = "📂 **Главное меню:**"
     if update.callback_query:
+        logger.info(f"[CMD_LIST] opened from callback by user_id={update.effective_user.id}")
         await update.callback_query.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
     else:
+        logger.info(f"[CMD_LIST] opened from message by user_id={update.effective_user.id}")
         await update.message.reply_text(
             text,
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -581,7 +595,21 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
+    try:
+        logger.info(
+            f"[CALLBACK RECEIVED] from_user={getattr(query.from_user, 'id', None)} "
+            f"data={repr(getattr(query, 'data', None))} "
+            f"message_id={getattr(getattr(query, 'message', None), 'message_id', None)} "
+            f"chat_id={getattr(getattr(query, 'message', None), 'chat_id', None)}"
+        )
+    except Exception as e:
+        logger.error(f"[CALLBACK LOG ERROR] {e}")
+
     if query.from_user.id != ADMIN_ID or query.data == "none":
+        logger.info(
+            f"[CALLBACK IGNORED] user_id={query.from_user.id}, data={repr(query.data)}"
+        )
         await query.answer()
         return
 
@@ -661,6 +689,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "main_menu":
         await cmd_list(update, context)
+
+
+def log_inline_keyboard(prefix: str, keyboard):
+    try:
+        rows_data = []
+        for row_idx, row in enumerate(keyboard):
+            row_dump = []
+            for btn in row:
+                row_dump.append({
+                    "text": getattr(btn, "text", None),
+                    "callback_data": getattr(btn, "callback_data", None)
+                })
+            rows_data.append({
+                "row": row_idx,
+                "buttons": row_dump
+            })
+
+        logger.info(f"[INLINE KEYBOARD] {prefix}")
+        logger.info(json.dumps(rows_data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.error(f"[INLINE KEYBOARD LOG ERROR] {e}")
+
 
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
