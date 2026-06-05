@@ -449,14 +449,19 @@ async def show_manage_menu(query, cid, db):
     text += f"🎯 Основной канал: `{custom_target}`\n"
 
     # Показываем список доп. каналов
+    # 1. Prepare the extra channels string safely outside the main f-string
     if extra_targets:
-        # Change et[\"chat_id\"] to et['chat_id']
-        text += f"➕ Доп. каналы: {', '.join(f'`{et['chat_id']}`' for et in extra_targets)}\n"
+        extra_channels_str = ", ".join(f"`{et['chat_id']}`" for et in extra_targets)
     else:
-        text += "➕ Доп. каналы: нет\n"
+        extra_channels_str = "нет"
 
-    text += f"🆕 Автосоздание топиков: {'✅ ВКЛ' if auto_create_topics else '⛔ ВЫКЛ'}\n\n"
-    text += "🔍 `[Статус] Имя (ID источника) ➡️ ID топика`"
+    safe_title = escape_md(cdata['title'])
+    text = f"⚙️ **Управление:** {safe_title} (`{cid}`)\n\n"
+    text += f"Статус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}\n"
+    text += f"🎯 Основной канал: `{custom_target}`\n"
+    
+    # 2. Insert the pre-formatted string here
+    text += f"➕ Доп. каналы: {extra_channels_str}\n"
 
     keyboard = [
         [InlineKeyboardButton(
