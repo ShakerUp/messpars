@@ -66,9 +66,6 @@ def get_user_marker(user_id: int):
         return "🔹"
     return USER_MARKERS[user_id % len(USER_MARKERS)]
 
-# режим отображения:
-# "compact"  -> 🔹 Андрей: текст
-# "classic"  -> 🔵 Андрей \n текст
 DISPLAY_MODE = "compact"
 
 client = None
@@ -83,10 +80,6 @@ def get_now_kyiv():
     return datetime.now(timezone.utc) + timedelta(hours=KYIV_OFFSET)
 
 def render_message_html(msg) -> str:
-    """
-    Возвращает текст сообщения в HTML с сохранением оригинальных стилей Telethon:
-    bold, italic, code, pre, text links, underline, strike, spoiler и т.п.
-    """
     try:
         text = msg.message or ""
         entities = getattr(msg, "entities", None) or []
@@ -96,7 +89,7 @@ def render_message_html(msg) -> str:
     except Exception as e:
         logger.warning(f"[STYLE ERROR] Не удалось распарсить entities: {e}")
         return escape(msg.message or "")
-      
+
 def escape_md(text: str) -> str:
     if text is None:
         return ""
@@ -106,12 +99,6 @@ def escape_md(text: str) -> str:
     return text
 
 def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -> str:
-    """
-    Собирает итоговый HTML:
-    - наш префикс
-    - оригинальный текст со стилями
-    - пометка редактирования (если edited=True)
-    """
     original_html = render_message_html(msg)
 
     safe_sender = escape(sender_name or "Unknown")
@@ -123,10 +110,7 @@ def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -
         header = f"{safe_marker} <b>{safe_sender}</b>"
 
     if original_html:
-        if DISPLAY_MODE == "compact":
-            result = f"{header}\n{original_html}"
-        else:
-            result = f"{header}\n{original_html}"
+        result = f"{header}\n{original_html}"
     else:
         result = header
 
@@ -137,10 +121,6 @@ def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -
     return result
 
 def parse_log_timestamp(line: str):
-    """
-    Парсит timestamp в начале строки лога:
-    2026-03-31 21:14:15,123 | ...
-    """
     m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}\s\|", line)
     if not m:
         return None
@@ -150,114 +130,119 @@ def parse_log_timestamp(line: str):
         return None
 
 def prune_old_logs():
-    """
-    Оставляет в основном лог-файле только записи за последние 2 суток.
-    """
     if not os.path.exists(LOG_FILE):
         return
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOG_RETENTION_DAYS)
-
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
-
         kept = []
         keep_current_block = False
-
         for line in lines:
             ts = parse_log_timestamp(line)
             if ts is not None:
                 keep_current_block = ts >= cutoff
-
             if keep_current_block:
                 kept.append(line)
-
         with open(LOG_FILE, "w", encoding="utf-8") as f:
             f.writelines(kept)
-
     except Exception as e:
         logger.error(f"[LOG PRUNE ERROR] {e}")
 
 def collect_recent_logs(hours=LOG_EXPORT_HOURS) -> str:
-    """
-    Собирает логи за последние N часов во временный файл и возвращает путь.
-    """
     if not os.path.exists(LOG_FILE):
         return None
-
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     output_path = f"logs_last_{hours}h.txt"
-
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
-
         selected = []
         keep_current_block = False
-
         for line in lines:
             ts = parse_log_timestamp(line)
             if ts is not None:
                 keep_current_block = ts >= cutoff
-
             if keep_current_block:
                 selected.append(line)
-
         if not selected:
             selected = ["За последние 24 часа записей нет.\n"]
-
         with open(output_path, "w", encoding="utf-8") as f:
             f.writelines(selected)
-
         return output_path
-
     except Exception as e:
         logger.error(f"[LOG EXPORT ERROR] {e}")
         return None
 
 # ====== DATABASE ======
+# Схема расширена: добавлена таблица msg_map_extra для хранения
+# маппингов сообщений в дополнительные каналы-назначения.
+# Основная таблица msg_map не изменилась — обратная совместимость сохранена.
+
 class DB:
     @staticmethod
     def init():
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute(
-                'CREATE TABLE IF NOT EXISTS msg_map (src_id INTEGER PRIMARY KEY, tgt_id INTEGER, tid INTEGER, custom_target_id INTEGER)'
+                'CREATE TABLE IF NOT EXISTS msg_map '
+                '(src_id INTEGER PRIMARY KEY, tgt_id INTEGER, tid INTEGER, custom_target_id INTEGER)'
+            )
+            # Новая таблица: маппинг src_id -> (tgt_chat_id, tgt_id, tid) для каждого доп. канала.
+            # Одному src_id может соответствовать несколько строк (по одной на доп. канал).
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS msg_map_extra '
+                '(src_id INTEGER, tgt_chat_id INTEGER, tgt_id INTEGER, tid INTEGER, '
+                'PRIMARY KEY (src_id, tgt_chat_id))'
             )
 
     @staticmethod
     def save(src_id, tgt_chat_id, tgt_id, tid):
+        """Сохраняет маппинг для основного канала."""
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute(
-                '''
-                INSERT OR REPLACE INTO msg_map
-                (src_id, tgt_id, tid, custom_target_id)
-                VALUES (?, ?, ?, ?)
-                ''',
+                'INSERT OR REPLACE INTO msg_map (src_id, tgt_id, tid, custom_target_id) VALUES (?, ?, ?, ?)',
                 (src_id, tgt_id, tid, tgt_chat_id)
             )
 
     @staticmethod
+    def save_extra(src_id, tgt_chat_id, tgt_id, tid):
+        """Сохраняет маппинг для дополнительного канала."""
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO msg_map_extra (src_id, tgt_chat_id, tgt_id, tid) VALUES (?, ?, ?, ?)',
+                (src_id, tgt_chat_id, tgt_id, tid)
+            )
+
+    @staticmethod
     def get(src_id):
+        """Возвращает маппинг основного канала."""
         with sqlite3.connect(DB_FILE) as conn:
             r = conn.execute(
-                '''
-                SELECT tgt_id, tid, custom_target_id
-                FROM msg_map
-                WHERE src_id = ?
-                ''',
+                'SELECT tgt_id, tid, custom_target_id FROM msg_map WHERE src_id = ?',
                 (src_id,)
             ).fetchone()
-
             if r:
-                return {
-                    "tgt_id": r[0],
-                    "tid": r[1],
-                    "tgt_chat_id": r[2]
-                }
+                return {"tgt_id": r[0], "tid": r[1], "tgt_chat_id": r[2]}
             return None
 
+    @staticmethod
+    def get_extra(src_id):
+        """
+        Возвращает список маппингов для всех дополнительных каналов.
+        Формат: [{"tgt_chat_id": ..., "tgt_id": ..., "tid": ...}, ...]
+        """
+        with sqlite3.connect(DB_FILE) as conn:
+            rows = conn.execute(
+                'SELECT tgt_chat_id, tgt_id, tid FROM msg_map_extra WHERE src_id = ?',
+                (src_id,)
+            ).fetchall()
+            return [{"tgt_chat_id": r[0], "tgt_id": r[1], "tid": r[2]} for r in rows]
+
 # ====== TOPIC MANAGER ======
+# Новое поле в JSON-конфиге чата: "extra_targets" — список доп. каналов.
+# Каждый элемент: {"chat_id": int, "topics": {"<source_tid>": <target_tid>}}
+# Топики для доп. каналов управляются независимо от основного.
+
 class TopicManager:
     @staticmethod
     def load_db():
@@ -315,11 +300,16 @@ class TopicManager:
                 "enabled": default_enabled,
                 "custom_target_id": None,
                 "auto_create_topics": True,
+                "extra_targets": [],   # <- список доп. каналов
                 "topics": {}
             }
 
         if "auto_create_topics" not in db[c_key]:
             db[c_key]["auto_create_topics"] = True
+
+        # Миграция: добавляем поле если его нет в старых записях
+        if "extra_targets" not in db[c_key]:
+            db[c_key]["extra_targets"] = []
 
         existing_topic = db[c_key]["topics"].get(t_key, {})
         db[c_key]["topics"][t_key] = {
@@ -331,37 +321,139 @@ class TopicManager:
         }
         TopicManager.save_db(db)
 
+    # ------------------------------------------------------------------ #
+    # Новые методы для управления дополнительными каналами
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def get_extra_targets(chat_id: str) -> list:
+        """
+        Возвращает список доп. каналов для источника.
+        Формат: [{"chat_id": int, "topics": {"<s_tid>": <t_tid>}}, ...]
+        """
+        db = TopicManager.load_db()
+        return db.get(str(chat_id), {}).get("extra_targets", [])
+
+    @staticmethod
+    def add_extra_target(chat_id: str, extra_chat_id: int) -> bool:
+        """Добавляет доп. канал к источнику. Возвращает False если уже есть."""
+        db = TopicManager.load_db()
+        c_key = str(chat_id)
+        if c_key not in db:
+            return False
+        if "extra_targets" not in db[c_key]:
+            db[c_key]["extra_targets"] = []
+
+        # Проверяем дубликат
+        for et in db[c_key]["extra_targets"]:
+            if et["chat_id"] == extra_chat_id:
+                return False
+
+        db[c_key]["extra_targets"].append({"chat_id": extra_chat_id, "topics": {}})
+        TopicManager.save_db(db)
+        return True
+
+    @staticmethod
+    def remove_extra_target(chat_id: str, extra_chat_id: int):
+        """Удаляет доп. канал из источника."""
+        db = TopicManager.load_db()
+        c_key = str(chat_id)
+        if c_key not in db:
+            return
+        db[c_key]["extra_targets"] = [
+            et for et in db[c_key].get("extra_targets", [])
+            if et["chat_id"] != extra_chat_id
+        ]
+        TopicManager.save_db(db)
+
+    @staticmethod
+    def set_extra_topic(chat_id: str, extra_chat_id: int, s_tid: str, t_tid: int):
+        """Сохраняет маппинг топика для конкретного доп. канала."""
+        db = TopicManager.load_db()
+        c_key = str(chat_id)
+        for et in db.get(c_key, {}).get("extra_targets", []):
+            if et["chat_id"] == extra_chat_id:
+                et["topics"][str(s_tid)] = t_tid
+                TopicManager.save_db(db)
+                return
+
+    @staticmethod
+    def get_extra_topic(chat_id: str, extra_chat_id: int, s_tid) -> int | None:
+        """Возвращает target_tid для конкретного доп. канала и source topic."""
+        for et in TopicManager.get_extra_targets(chat_id):
+            if et["chat_id"] == extra_chat_id:
+                return et["topics"].get(str(s_tid))
+        return None
+
+# ====== FORUM MANAGER ======
+class ForumManager:
+    @staticmethod
+    async def create_topic(target_chat, chat_title, s_tname=None):
+        try:
+            name = (f"{s_tname} | {chat_title}" if s_tname else f"💬 {chat_title}")[:120]
+            res = await bot_app.bot.create_forum_topic(chat_id=target_chat, name=name)
+            tid = res.message_thread_id
+            logger.info(f"[FORUM] Создан новый топик '{name}' ID: {tid} в чате {target_chat}")
+            return tid
+        except Exception as e:
+            logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
+            return None
+
+def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
+    if getattr(msg, 'message_thread_id', None):
+        return int(msg.message_thread_id)
+
+    reply_to = getattr(msg, 'reply_to', None)
+    if not reply_to:
+        return 0
+
+    if getattr(reply_to, 'reply_to_top_id', None):
+        return int(reply_to.reply_to_top_id)
+
+    if getattr(reply_to, 'reply_to_msg_id', None):
+        candidate = int(reply_to.reply_to_msg_id)
+        known_topics = (chat_conf or {}).get('topics', {})
+        if str(candidate) in known_topics:
+            return candidate
+        if isinstance(chat, Channel) and getattr(chat, 'forum', False):
+            return candidate
+
+    return 0
+
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
+
 async def show_manage_menu(query, cid, db):
-    # Пытаемся найти ID как есть, а если не нашли - пробуем убрать -100
     cdata = db.get(str(cid))
     if not cdata:
         alt_cid = str(cid).replace("-100", "")
         cdata = db.get(alt_cid)
         if cdata:
-            cid = alt_cid # фиксируем найденный ключ
-            
+            cid = alt_cid
     if not cdata:
-        # Если всё равно не нашли, пробуем наоборот добавить -100
         alt_cid = f"-100{cid}" if not str(cid).startswith("-100") else cid
         cdata = db.get(alt_cid)
         if cdata:
             cid = alt_cid
-            
     if not cdata:
         logger.warning(f"ID {cid} не найден в базе при попытке открыть меню")
         return
-    # ... остальной код функции
 
     is_private = cdata.get('type') == 'private'
     custom_target = cdata.get('custom_target_id') or "По умолчанию (из .env)"
     auto_create_topics = cdata.get('auto_create_topics', True)
+    extra_targets = cdata.get('extra_targets', [])
 
     safe_title = escape_md(cdata['title'])
     text = f"⚙️ **Управление:** {safe_title} (`{cid}`)\n\n"
-    
     text += f"Статус: {'✅ ВКЛ' if cdata['enabled'] else '⏸ ПАУЗА'}\n"
-    text += f"🎯 Куда шлем: `{custom_target}`\n"
+    text += f"🎯 Основной канал: `{custom_target}`\n"
+
+    # Показываем список доп. каналов
+    if extra_targets:
+        text += f"➕ Доп. каналы: {', '.join(f'`{et[\"chat_id\"]}`' for et in extra_targets)}\n"
+    else:
+        text += "➕ Доп. каналы: нет\n"
+
     text += f"🆕 Автосоздание топиков: {'✅ ВКЛ' if auto_create_topics else '⛔ ВЫКЛ'}\n\n"
     text += "🔍 `[Статус] Имя (ID источника) ➡️ ID топика`"
 
@@ -370,15 +462,23 @@ async def show_manage_menu(query, cid, db):
             f"{'🔴 ВЫКЛЮЧИТЬ ЧАТ' if cdata['enabled'] else '🟢 ВКЛЮЧИТЬ ЧАТ'}",
             callback_data=f"tgc_{cid}"
         )],
-        [InlineKeyboardButton(
-            "🎯 ИЗМЕНИТЬ КАНАЛ НАЗНАЧЕНИЯ",
-            callback_data=f"editchat_{cid}"
-        )],
+        [InlineKeyboardButton("🎯 ИЗМЕНИТЬ ОСНОВНОЙ КАНАЛ", callback_data=f"editchat_{cid}")],
+        [InlineKeyboardButton("➕ ДОБАВИТЬ ДОП. КАНАЛ", callback_data=f"addextra_{cid}")],
         [InlineKeyboardButton(
             "⛔ НЕ СОЗДАВАТЬ НОВЫЕ ТОПИКИ" if auto_create_topics else "✅ РАЗРЕШИТЬ СОЗДАНИЕ ТОПИКОВ",
             callback_data=f"tat_{cid}"
         )]
     ]
+
+    # Кнопки удаления доп. каналов
+    for et in extra_targets:
+        ec_id = et["chat_id"]
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🗑 Удалить доп. канал {ec_id}",
+                callback_data=f"delextra_{cid}_{ec_id}"
+            )
+        ])
 
     if not is_private:
         keyboard.append([InlineKeyboardButton("--- Настройка веток ---", callback_data="none")])
@@ -389,10 +489,7 @@ async def show_manage_menu(query, cid, db):
             target_id = tdata.get('topic_id', '???')
 
             btn_display = f"{t_status} {t_title} ({tid}) ➡️ {target_id}"
-
-            keyboard.append([
-                InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}")
-            ])
+            keyboard.append([InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}")])
             keyboard.append([
                 InlineKeyboardButton(
                     "⏸ ОТКЛЮЧИТЬ ВЕТКУ" if t_enabled else "🟢 ВКЛЮЧИТЬ ВЕТКУ",
@@ -430,18 +527,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-        
+
 async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     prune_old_logs()
     log_path = collect_recent_logs(LOG_EXPORT_HOURS)
-
     if not log_path or not os.path.exists(log_path):
         await update.message.reply_text("❌ Не удалось собрать лог за последние 24 часа.")
         return
-
     try:
         with open(log_path, "rb") as f:
             await update.message.reply_document(
@@ -458,11 +552,10 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(log_path)
         except Exception:
             pass
-          
+
 async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     if len(context.args) < 3:
         await update.message.reply_text(
             "Использование:\n"
@@ -471,7 +564,6 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/bindtopic -1001234567890 17 2456"
         )
         return
-
     try:
         source_chat_id = int(context.args[0])
         source_topic_id = int(context.args[1])
@@ -479,21 +571,16 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Все аргументы должны быть числами.")
         return
-
     if source_topic_id <= 0:
         await update.message.reply_text("❌ source_topic_id должен быть больше 0.")
         return
-
     if target_topic_id <= 0:
         await update.message.reply_text("❌ target_topic_id должен быть больше 0.")
         return
-
     try:
         db = TopicManager.load_db()
         c_key = str(source_chat_id)
         t_key = str(source_topic_id)
-
-        # если чат уже известен — ничего важного не трогаем
         if c_key not in db:
             db[c_key] = {
                 "title": f"ManualBind {source_chat_id}",
@@ -501,30 +588,26 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "enabled": True,
                 "custom_target_id": None,
                 "auto_create_topics": True,
+                "extra_targets": [],
                 "topics": {}
             }
-
         if "topics" not in db[c_key]:
             db[c_key]["topics"] = {}
-
         if "auto_create_topics" not in db[c_key]:
             db[c_key]["auto_create_topics"] = True
-
+        if "extra_targets" not in db[c_key]:
+            db[c_key]["extra_targets"] = []
         existing_topic = db[c_key]["topics"].get(t_key, {})
-
         db[c_key]["topics"][t_key] = {
             "topic_id": target_topic_id,
             "title": existing_topic.get("title") or f"Thread {source_topic_id}",
             "enabled": existing_topic.get("enabled", True)
         }
-
         TopicManager.save_db(db)
-
         logger.info(
             f"[MANUAL BIND] source_chat_id={source_chat_id}, "
             f"source_topic_id={source_topic_id}, target_topic_id={target_topic_id}"
         )
-
         await update.message.reply_text(
             "✅ Маппинг ветки сохранён.\n"
             f"source_chat_id = `{source_chat_id}`\n"
@@ -532,7 +615,6 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"target_topic_id = `{target_topic_id}`",
             parse_mode="Markdown"
         )
-
     except Exception as e:
         logger.error(f"[BINDTOPIC ERROR] {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -575,21 +657,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("tat_"):
         cid = data.split("_", 1)[1]
-
         if cid in db:
             current = db[cid].get("auto_create_topics", True)
             db[cid]["auto_create_topics"] = not current
             TopicManager.save_db(db)
-
         await show_manage_menu(query, cid, db)
 
     elif data.startswith("editchat_"):
         cid = data.split("_", 1)[1]
         user_edit_state[query.from_user.id] = {"mode": "target_chat", "cid": cid}
         await query.message.reply_text(
-            "📝 Введите **ID нового канала**, куда пересылать сообщения из этого источника.\n"
+            "📝 Введите **ID основного канала**, куда пересылать сообщения.\n"
             "Чтобы вернуть стандартный канал, введите `0`."
         )
+
+    elif data.startswith("addextra_"):
+        # Запрашиваем ID нового доп. канала
+        cid = data.split("_", 1)[1]
+        user_edit_state[query.from_user.id] = {"mode": "add_extra_target", "cid": cid}
+        await query.message.reply_text(
+            "📝 Введите **ID дополнительного канала**, в который нужно дублировать сообщения:"
+        )
+
+    elif data.startswith("delextra_"):
+        # delextra_<cid>_<extra_chat_id>
+        parts = data.split("_", 2)
+        cid = parts[1]
+        extra_chat_id = int(parts[2])
+        TopicManager.remove_extra_target(cid, extra_chat_id)
+        db = TopicManager.load_db()  # перечитываем после изменения
+        await show_manage_menu(query, cid, db)
 
     elif data.startswith("editid_"):
         _, cid, tid = data.split("_", 2)
@@ -607,12 +704,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("tgt_"):
         _, cid, tid = data.split("_", 2)
-
         if cid in db and tid in db[cid].get('topics', {}):
             current = db[cid]['topics'][tid].get('enabled', True)
             db[cid]['topics'][tid]['enabled'] = not current
             TopicManager.save_db(db)
-
         await show_manage_menu(query, cid, db)
 
     elif data == "main_menu":
@@ -635,10 +730,25 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             try:
                 db[cid]['custom_target_id'] = int(new_input)
-                text = f"✅ Сообщения из этого источника теперь будут лететь в канал `{new_input}`"
+                text = f"✅ Основной канал назначения изменён на `{new_input}`"
             except:
                 await update.message.reply_text("❌ Ошибка: Введите корректный ID (число).")
                 return
+
+    elif state["mode"] == "add_extra_target":
+        try:
+            extra_chat_id = int(new_input)
+        except ValueError:
+            await update.message.reply_text("❌ Ошибка: Введите корректный ID (число).")
+            return
+        added = TopicManager.add_extra_target(cid, extra_chat_id)
+        if added:
+            text = (
+                f"✅ Дополнительный канал `{extra_chat_id}` добавлен.\n"
+                "Топики для него будут создаваться автоматически при первом сообщении."
+            )
+        else:
+            text = f"⚠️ Канал `{extra_chat_id}` уже добавлен или источник не найден."
 
     elif state["mode"] == "topic_id":
         tid = state["tid"]
@@ -652,44 +762,128 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TopicManager.save_db(db)
     await update.message.reply_text(text + "\nИспользуйте /list для управления.")
 
-# ====== FORUM MANAGER ======
-class ForumManager:
-    @staticmethod
-    async def create_topic(target_chat, chat_title, s_tname=None):
+# ====== CORE SEND LOGIC ======
+# Выделена отдельная функция отправки в один канал — используется и для основного,
+# и для каждого доп. канала.
+
+async def send_to_target(
+    msg,
+    prefixed_text: str,
+    target_chat: int,
+    target_tid: int,
+    reply_to_target_id: int | None,
+    chat,
+    chat_id_str: str,
+    source_top_id: int,
+    chat_title: str,
+    chat_type: str,
+    source_topic_title: str | None,
+    auto_create_topics: bool,
+    is_extra: bool = False
+) -> int | None:
+    """
+    Отправляет сообщение в указанный канал/топик.
+    Возвращает message_id отправленного сообщения или None при ошибке.
+
+    is_extra=True — отправка в доп. канал (маппинг топиков берётся из extra_targets).
+    """
+
+    current_target_tid = target_tid
+
+    for attempt in range(2):
+        if not current_target_tid:
+            if not auto_create_topics:
+                logger.info(
+                    f"[SKIP AUTO CREATE {'EXTRA' if is_extra else 'MAIN'}] "
+                    f"chat={chat_id_str}, title={chat_title}, "
+                    f"source_topic={source_top_id} — автосоздание выключено"
+                )
+                return None
+
+            logger.info(
+                f"[AUTO {'EXTRA' if is_extra else 'MAIN'}] "
+                f"Создаю топик для {chat_title} (source_topic={source_top_id}) "
+                f"в канале {target_chat}..."
+            )
+            new_tid = await ForumManager.create_topic(target_chat, chat_title, s_tname=source_topic_title)
+            if not new_tid:
+                return None
+
+            current_target_tid = new_tid
+
+            if is_extra:
+                TopicManager.set_extra_topic(chat_id_str, target_chat, str(source_top_id), new_tid)
+            else:
+                TopicManager.register_source(
+                    int(chat_id_str), chat_title, chat_type,
+                    source_top_id, s_tname=source_topic_title, target_tid=new_tid
+                )
+
         try:
-            name = (f"{s_tname} | {chat_title}" if s_tname else f"💬 {chat_title}")[:120]
-            res = await bot_app.bot.create_forum_topic(chat_id=target_chat, name=name)
-            tid = res.message_thread_id
-            logger.info(f"[FORUM] Создан новый топик '{name}' ID: {tid} в чате {target_chat}")
-            return tid
+            current_reply_id = reply_to_target_id if attempt == 0 else None
+            send_kwargs = {
+                "chat_id": target_chat,
+                "message_thread_id": int(current_target_tid),
+                "reply_to_message_id": current_reply_id
+            }
+
+            if msg.media:
+                send_kwargs["parse_mode"] = "HTML"
+                send_kwargs["caption"] = prefixed_text
+                buf = io.BytesIO()
+                await msg.download_media(file=buf)
+                buf.seek(0)
+                buf.name = getattr(msg.file, 'name', 'file') or 'file'
+
+                if isinstance(msg.media, MessageMediaPhoto):
+                    sent = await bot_app.bot.send_photo(photo=buf, **send_kwargs)
+                elif (
+                    hasattr(msg.media, 'document')
+                    and any(hasattr(a, 'voice') and a.voice for a in msg.media.document.attributes)
+                ):
+                    sent = await bot_app.bot.send_voice(voice=buf, **send_kwargs)
+                else:
+                    sent = await bot_app.bot.send_document(document=buf, **send_kwargs)
+            else:
+                sent = await bot_app.bot.send_message(
+                    text=prefixed_text,
+                    parse_mode="HTML",
+                    **send_kwargs
+                )
+
+            logger.info(
+                f"[SUCCESS {'EXTRA' if is_extra else 'MAIN'}] "
+                f"Msg {msg.id} (Source Topic:{source_top_id}) ➡️ "
+                f"Target Msg {sent.message_id} (Target Topic:{current_target_tid}) "
+                f"in chat {target_chat}"
+            )
+            return sent.message_id
+
         except Exception as e:
-            logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
-            return None
+            err_str = str(e)
+            if "Message thread not found" in err_str or "thread" in err_str.lower():
+                logger.warning(
+                    f"[RE-CREATE {'EXTRA' if is_extra else 'MAIN'}] "
+                    f"Ветка {current_target_tid} невалидна. Пересоздаю..."
+                )
+                if is_extra:
+                    TopicManager.set_extra_topic(chat_id_str, target_chat, str(source_top_id), None)
+                else:
+                    db_data = TopicManager.load_db()
+                    if chat_id_str in db_data and str(source_top_id) in db_data[chat_id_str]['topics']:
+                        db_data[chat_id_str]['topics'][str(source_top_id)]['topic_id'] = None
+                        TopicManager.save_db(db_data)
+                current_target_tid = None
+                continue
+            elif "reply" in err_str.lower() or "Message to be replied not found" in err_str:
+                continue
+            else:
+                logger.error(f"[ERROR {'EXTRA' if is_extra else 'MAIN'}] {e}")
+                break
 
-def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
-    if getattr(msg, 'message_thread_id', None):
-        return int(msg.message_thread_id)
+    return None
 
-    reply_to = getattr(msg, 'reply_to', None)
-    if not reply_to:
-        return 0
-
-    if getattr(reply_to, 'reply_to_top_id', None):
-        return int(reply_to.reply_to_top_id)
-
-    if getattr(reply_to, 'reply_to_msg_id', None):
-        candidate = int(reply_to.reply_to_msg_id)
-        known_topics = (chat_conf or {}).get('topics', {})
-
-        # Если topic уже известен для этого source-чата
-        if str(candidate) in known_topics:
-            return candidate
-
-        # Для forum-channel обычное сообщение в ветке часто выглядит именно так
-        if isinstance(chat, Channel) and getattr(chat, 'forum', False):
-            return candidate
-
-    return 0
+# ====== TELETHON HANDLERS ======
 
 async def telethon_handler(event):
     msg = event.message
@@ -712,11 +906,8 @@ async def telethon_handler(event):
 
     final_target_chat = chat_conf.get('custom_target_id') or DEFAULT_TARGET_CHAT_ID
 
-    # =====================================================
-    # 👤 ИМЯ + ЦВЕТ ОТПРАВИТЕЛЯ
-    # =====================================================
+    # ===== Имя + маркер =====
     sender_id = getattr(sender, "id", None)
-
     if isinstance(chat, Channel) and getattr(chat, 'broadcast', False):
         sender_name = chat_title
     elif isinstance(sender, User):
@@ -725,31 +916,23 @@ async def telethon_handler(event):
         sender_name = (first + " " + last).strip() or sender.username or "Unknown"
     else:
         sender_name = chat_title
-
     user_marker = get_user_marker(sender_id)
 
-    # =====================================================
-    # 🔥 ЛОГИКА ОПРЕДЕЛЕНИЯ ТОПИКА
-    # =====================================================
+    # ===== Source topic =====
     source_top_id = resolve_source_topic_id(msg, chat, chat_conf)
 
-    # Логика для маппинга ответов
+    # ===== Reply mapping =====
     reply_to_target_id = None
     reply_mapping = None
-
     if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id'):
         reply_mapping = DB.get(msg.reply_to.reply_to_msg_id)
         if reply_mapping:
             reply_to_target_id = reply_mapping['tgt_id']
 
-    # =====================================================
-    # 2. ИЩЕМ ЦЕЛЕВОЙ ТОПИК
-    # =====================================================
+    # ===== Target topic (основной канал) =====
     target_tid = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('topic_id')
-
     if not target_tid and reply_mapping:
         target_tid = reply_mapping.get('tid')
-
     if target_tid is not None and int(target_tid) <= 1:
         target_tid = None
 
@@ -766,159 +949,107 @@ async def telethon_handler(event):
         logger.info(f"[SKIP] Message {msg.id} skipped because topic {source_top_id} is disabled")
         return
 
-    # =====================================================
-    # ПОЛУЧЕНИЕ НАЗВАНИЯ ВЕТКИ
-    # =====================================================
+    # ===== Название ветки (для автосоздания) =====
     source_topic_title = None
-
-    if (
-        not is_private
-        and source_top_id
-        and int(source_top_id) > 0
-        and not target_tid
-    ):
+    if not is_private and source_top_id and int(source_top_id) > 0 and not target_tid:
         try:
             from telethon.tl.functions.channels import GetForumTopicsByIDRequest
-
-            res = await client(
-                GetForumTopicsByIDRequest(
-                    channel=chat,
-                    topics=[int(source_top_id)]
-                )
-            )
-
+            res = await client(GetForumTopicsByIDRequest(channel=chat, topics=[int(source_top_id)]))
             if res and getattr(res, "topics", None):
-                topic_obj = res.topics[0]
-                source_topic_title = getattr(topic_obj, "title", None)
-
+                source_topic_title = getattr(res.topics[0], "title", None)
         except Exception as e:
             logger.warning(f"[TOPIC TITLE ERROR] {e}")
 
-    # =====================================================
-    # 4. ФОРМИРУЕМ ТЕКСТ
-    # =====================================================
+    # ===== Текст =====
     prefixed_text = build_prefixed_html(sender_name, user_marker, msg, edited=False)
 
-    # =====================================================
-    # 5. ОТПРАВКА
-    # =====================================================
-    success = False
+    # ===== Ранний выход для новых приватных чатов =====
+    if not target_tid and status == "new" and is_private:
+        TopicManager.register_source(chat.id, chat_title, "private", 0)
+        return
 
-    for attempt in range(2):
+    if not target_tid and msg.reply_to and source_top_id == 0:
+        logger.info(
+            f"[SKIP REPLY AUTO CREATE] chat={chat.id}, msg={msg.id} "
+            f"— reply без явного source topic, новый топик не создаем"
+        )
+        return
 
-        if not target_tid:
-            if status == "new" and is_private:
-                TopicManager.register_source(chat.id, chat_title, "private", 0)
-                return
+    # ====================================================
+    # ОТПРАВКА В ОСНОВНОЙ КАНАЛ
+    # ====================================================
+    sent_main_id = await send_to_target(
+        msg=msg,
+        prefixed_text=prefixed_text,
+        target_chat=final_target_chat,
+        target_tid=target_tid,
+        reply_to_target_id=reply_to_target_id,
+        chat=chat,
+        chat_id_str=chat_id_str,
+        source_top_id=source_top_id,
+        chat_title=chat_title,
+        chat_type=chat_type,
+        source_topic_title=source_topic_title,
+        auto_create_topics=auto_create_topics,
+        is_extra=False
+    )
 
-            # Для reply-кейсов без явного source topic не создаем мусорный новый топик
-            if msg.reply_to and source_top_id == 0:
-                logger.info(
-                    f"[SKIP REPLY AUTO CREATE] chat={chat.id}, msg={msg.id}, "
-                    f"reply_to_msg_id={getattr(msg.reply_to, 'reply_to_msg_id', None)} "
-                    f"— reply без явного source topic, новый топик не создаем"
-                )
-                return
+    if sent_main_id:
+        # Перечитываем db после возможного обновления в send_to_target
+        db_data = TopicManager.load_db()
+        chat_conf = db_data.get(chat_id_str, {})
+        actual_tid = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('topic_id') or target_tid
+        DB.save(msg.id, final_target_chat, sent_main_id, int(actual_tid))
+    else:
+        logger.error(f"[FATAL MAIN] Не удалось отправить {msg.id}")
 
-            if not auto_create_topics:
-                logger.info(
-                    f"[SKIP AUTO CREATE] chat={chat.id}, title={chat_title}, "
-                    f"source_topic={source_top_id} — автосоздание топиков выключено"
-                )
-                return
+    # ====================================================
+    # ОТПРАВКА В ДОПОЛНИТЕЛЬНЫЕ КАНАЛЫ
+    # ====================================================
+    extra_targets = TopicManager.get_extra_targets(chat_id_str)
 
-            logger.info(f"[AUTO] Создаю новый топик для {chat_title} (Source Topic: {source_top_id})...")
-            target_tid = await ForumManager.create_topic(
-                final_target_chat,
-                chat_title,
-                s_tname=source_topic_title
+    for et in extra_targets:
+        extra_chat_id = et["chat_id"]
+
+        # Получаем reply_to для доп. канала из таблицы msg_map_extra
+        extra_reply_id = None
+        if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id'):
+            extra_mappings = DB.get_extra(msg.reply_to.reply_to_msg_id)
+            for em in extra_mappings:
+                if em["tgt_chat_id"] == extra_chat_id:
+                    extra_reply_id = em["tgt_id"]
+                    break
+
+        # Целевой топик для этого доп. канала
+        extra_target_tid = TopicManager.get_extra_topic(chat_id_str, extra_chat_id, source_top_id)
+        if extra_target_tid is not None and int(extra_target_tid) <= 1:
+            extra_target_tid = None
+
+        sent_extra_id = await send_to_target(
+            msg=msg,
+            prefixed_text=prefixed_text,
+            target_chat=extra_chat_id,
+            target_tid=extra_target_tid,
+            reply_to_target_id=extra_reply_id,
+            chat=chat,
+            chat_id_str=chat_id_str,
+            source_top_id=source_top_id,
+            chat_title=chat_title,
+            chat_type=chat_type,
+            source_topic_title=source_topic_title,
+            auto_create_topics=auto_create_topics,
+            is_extra=True
+        )
+
+        if sent_extra_id:
+            # Обновляем actual tid из конфига (мог обновиться в send_to_target)
+            actual_extra_tid = (
+                TopicManager.get_extra_topic(chat_id_str, extra_chat_id, source_top_id)
+                or extra_target_tid
             )
-
-            if not target_tid:
-                return
-
-            TopicManager.register_source(
-                chat.id,
-                chat_title,
-                chat_type,
-                source_top_id,
-                s_tname=source_topic_title,
-                target_tid=target_tid
-            )
-
-        try:
-            current_reply_id = reply_to_target_id if attempt == 0 else None
-
-            send_kwargs = {
-                "chat_id": final_target_chat,
-                "message_thread_id": int(target_tid),
-                "reply_to_message_id": current_reply_id
-            }
-
-            if msg.media:
-                send_kwargs["parse_mode"] = "HTML"
-                send_kwargs["caption"] = prefixed_text
-                buf = io.BytesIO()
-                await msg.download_media(file=buf)
-                buf.seek(0)
-                buf.name = getattr(msg.file, 'name', 'file') or 'file'
-
-                if isinstance(msg.media, MessageMediaPhoto):
-                    sent = await bot_app.bot.send_photo(photo=buf, **send_kwargs)
-
-                elif (
-                    hasattr(msg.media, 'document')
-                    and any(hasattr(a, 'voice') and a.voice for a in msg.media.document.attributes)
-                ):
-                    sent = await bot_app.bot.send_voice(voice=buf, **send_kwargs)
-
-                else:
-                    sent = await bot_app.bot.send_document(document=buf, **send_kwargs)
-
-            else:
-                sent = await bot_app.bot.send_message(
-                    text=prefixed_text,
-                    parse_mode="HTML",
-                    **send_kwargs
-                )
-
-            DB.save(
-                msg.id,
-                final_target_chat,
-                sent.message_id,
-                int(target_tid)
-            )
-
-            logger.info(
-                f"[SUCCESS] Msg {msg.id} (Source Topic:{source_top_id}) ➡️ "
-                f"Target Msg {sent.message_id} (Target Topic:{target_tid})"
-            )
-            success = True
-            break
-
-        except Exception as e:
-            err_str = str(e)
-
-            if "Message thread not found" in err_str or "thread" in err_str.lower():
-                logger.warning(f"[RE-CREATE] Ветка {target_tid} невалидна. Пересоздаю...")
-
-                db_data = TopicManager.load_db()
-                if chat_id_str in db_data and str(source_top_id) in db_data[chat_id_str]['topics']:
-                    db_data[chat_id_str]['topics'][str(source_top_id)]['topic_id'] = None
-                    TopicManager.save_db(db_data)
-
-                target_tid = None
-                continue
-
-            elif "reply" in err_str.lower() or "Message to be replied not found" in err_str:
-                continue
-
-            else:
-                logger.error(f"[ERROR] {e}")
-                break
-
-    if not success:
-        logger.error(f"[FATAL] Не удалось отправить {msg.id}")
+            DB.save_extra(msg.id, extra_chat_id, sent_extra_id, int(actual_extra_tid))
+        else:
+            logger.error(f"[FATAL EXTRA] Не удалось отправить {msg.id} в доп. канал {extra_chat_id}")
 
 async def telethon_edit_handler(event):
     log_full_message(event, tag="EDIT")
@@ -929,13 +1060,10 @@ async def telethon_edit_handler(event):
         logger.warning(f"[EDIT] Нет маппинга для сообщения {msg.id}")
         return
 
-    target_chat = rel["tgt_chat_id"]
-
     try:
         sender = await event.get_sender()
         chat = await event.get_chat()
 
-        # ===== Имя отправителя =====
         if isinstance(chat, Channel) and getattr(chat, 'broadcast', False):
             sender_name = getattr(chat, 'title', 'Unknown')
             sender_id = getattr(chat, 'id', None)
@@ -948,33 +1076,42 @@ async def telethon_edit_handler(event):
             sender_name = "Unknown"
             sender_id = None
 
-        # ===== Цвет =====
         user_marker = get_user_marker(sender_id)
-
-        # ===== Новый текст =====
         updated_text = build_prefixed_html(sender_name, user_marker, msg, edited=True)
 
-        logger.info(f"[EDIT] Обновляю сообщение {rel['tgt_id']}")
+        # ===== Редактируем в основном канале =====
+        logger.info(f"[EDIT MAIN] Обновляю сообщение {rel['tgt_id']} в {rel['tgt_chat_id']}")
+        await _edit_message(rel['tgt_chat_id'], rel['tgt_id'], msg, updated_text)
 
+        # ===== Редактируем во всех доп. каналах =====
+        extra_rels = DB.get_extra(msg.id)
+        for er in extra_rels:
+            logger.info(f"[EDIT EXTRA] Обновляю {er['tgt_id']} в {er['tgt_chat_id']}")
+            await _edit_message(er['tgt_chat_id'], er['tgt_id'], msg, updated_text)
+
+    except Exception as e:
+        logger.error(f"[EDIT ERROR] {e}")
+
+async def _edit_message(target_chat: int, target_msg_id: int, msg, updated_text: str):
+    """Вспомогательная функция: редактирует одно сообщение в одном канале."""
+    try:
         if msg.media:
             await bot_app.bot.edit_message_caption(
                 chat_id=target_chat,
-                message_id=rel["tgt_id"],
+                message_id=target_msg_id,
                 caption=updated_text,
                 parse_mode="HTML"
             )
         else:
             await bot_app.bot.edit_message_text(
                 chat_id=target_chat,
-                message_id=rel["tgt_id"],
+                message_id=target_msg_id,
                 text=updated_text,
                 parse_mode="HTML"
             )
-
-        logger.info(f"[EDIT SUCCESS] {rel['tgt_id']} обновлено")
-
+        logger.info(f"[EDIT OK] {target_msg_id} в {target_chat} обновлено")
     except Exception as e:
-        logger.error(f"[EDIT ERROR] {e}")
+        logger.error(f"[EDIT MSG ERROR] chat={target_chat}, msg={target_msg_id}: {e}")
 
 def log_full_message(event, tag="NEW"):
     try:
@@ -1031,7 +1168,7 @@ async def main():
     client.add_event_handler(telethon_edit_handler, events.MessageEdited())
 
     await client.start()
-    logger.info("🚀 Бот запущен. Исправлена логика топиков и редактирования.")
+    logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
     async with bot_app:
         await bot_app.updater.start_polling()
