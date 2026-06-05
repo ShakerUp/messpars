@@ -450,7 +450,8 @@ async def show_manage_menu(query, cid, db):
 
     # Показываем список доп. каналов
     if extra_targets:
-        text += f"➕ Доп. каналы: {', '.join(f'`{et[\"chat_id\"]}`' for et in extra_targets)}\n"
+        # Change et[\"chat_id\"] to et['chat_id']
+        text += f"➕ Доп. каналы: {', '.join(f'`{et['chat_id']}`' for et in extra_targets)}\n"
     else:
         text += "➕ Доп. каналы: нет\n"
 
