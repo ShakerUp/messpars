@@ -729,6 +729,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = TopicManager.load_db()
     cid = state["cid"]
 
+    # Флаг, определяющий, нужно ли сохранять db в конце функции
+    need_save = True
+
     if state["mode"] == "target_chat":
         if new_input == "0":
             db[cid]['custom_target_id'] = None
@@ -747,6 +750,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Ошибка: Введите корректный ID (число).")
             return
+        
         added = TopicManager.add_extra_target(cid, extra_chat_id)
         if added:
             text = (
@@ -755,6 +759,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             text = f"⚠️ Канал `{extra_chat_id}` уже добавлен или источник не найден."
+        
+        # Так как add_extra_target уже сохранил всё сам, 
+        # нам НЕ нужно вызывать save_db(db) со старыми данными в конце.
+        need_save = False 
 
     elif state["mode"] == "topic_id":
         tid = state["tid"]
@@ -765,7 +773,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Ошибка: Введите число.")
             return
 
-    TopicManager.save_db(db)
+    # Сохраняем только если данные менялись прямо в локальной db
+    if need_save:
+        TopicManager.save_db(db)
+        
     await update.message.reply_text(text + "\nИспользуйте /list для управления.")
 
 # ====== CORE SEND LOGIC ======
