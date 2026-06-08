@@ -1005,6 +1005,9 @@ async def telethon_handler(event):
 
     # ===== Текст =====
     prefixed_text = build_prefixed_html(sender_name, user_marker, msg, edited=False)
+    logger.info(f"[HTML DEBUG] entities={getattr(msg, 'entities', [])}")
+    logger.info(f"[HTML DEBUG] raw_text={repr(msg.message)}")
+    logger.info(f"[HTML DEBUG] final_html={repr(prefixed_text)}")
 
     # ===== Ранний выход для новых приватных чатов =====
     if not target_tid and status == "new" and is_private:
