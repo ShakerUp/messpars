@@ -80,15 +80,46 @@ def get_now_kyiv():
     return datetime.now(timezone.utc) + timedelta(hours=KYIV_OFFSET)
 
 def render_message_html(msg) -> str:
+    """
+    Конвертирует текст + entities Telethon в HTML для Bot API.
+    Фиксы:
+    - убираем артефакт '{}' который Telethon генерирует для неизвестных entity-типов
+    - убираем пустые <pre></pre> и <code></code>
+    """
     try:
         text = msg.message or ""
         entities = getattr(msg, "entities", None) or []
         if not text:
             return ""
-        return telethon_html.unparse(text, entities)
+
+        # Фильтруем entity-типы которые порождают '{}'
+        from telethon.tl.types import MessageEntityCustomEmoji
+        SKIP_ENTITY_TYPES = (MessageEntityCustomEmoji,)
+        try:
+            filtered_entities = [e for e in entities if not isinstance(e, SKIP_ENTITY_TYPES)]
+        except Exception:
+            filtered_entities = entities
+
+        result = telethon_html.unparse(text, filtered_entities)
+
+        # Убираем оставшиеся артефакты '{}'
+        result = re.sub(r'\{\}', '', result)
+
+        # Убираем пустые теги
+        result = re.sub(r'<pre>\s*</pre>', '', result)
+        result = re.sub(r'<code>\s*</code>', '', result)
+
+        return result
+
     except Exception as e:
         logger.warning(f"[STYLE ERROR] Не удалось распарсить entities: {e}")
         return escape(msg.message or "")
+
+def has_pre_block(msg) -> bool:
+    """Проверяет, содержит ли сообщение блок <pre> (моноширинная таблица/код)."""
+    from telethon.tl.types import MessageEntityPre
+    entities = getattr(msg, "entities", None) or []
+    return any(isinstance(e, MessageEntityPre) for e in entities)
 
 def escape_md(text: str) -> str:
     if text is None:
@@ -110,7 +141,17 @@ def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -
         header = f"{safe_marker} <b>{safe_sender}</b>"
 
     if original_html:
-        result = f"{header}\n{original_html}"
+        if has_pre_block(msg):
+            # Для сообщений с <pre> (таблицы, код):
+            # Telethon при unparse оборачивает весь pre-контент так:
+            # <pre>строка1\nстрока2...</pre>
+            # Первая строка таблицы оказывается прямо после <pre> — без переноса.
+            # Вставляем \n сразу после каждого открывающего <pre>, чтобы
+            # таблица начиналась с чистой строки и не смещалась.
+            fixed_html = re.sub(r'<pre>(?!\n)', '<pre>\n', original_html)
+            result = f"{header}\n{fixed_html}"
+        else:
+            result = f"{header}\n{original_html}"
     else:
         result = header
 
