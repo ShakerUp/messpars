@@ -109,6 +109,29 @@ def render_message_html(msg) -> str:
         result = re.sub(r'<pre>\s*</pre>', '', result)
         result = re.sub(r'<code>\s*</code>', '', result)
 
+        # Bot API не поддерживает <pre><code class='language-X'>...</code></pre>
+        # Telethon генерирует именно такую структуру для MessageEntityPre.
+        # Разворачиваем: оставляем только <pre>содержимое</pre>, убирая
+        # вложенный <code class=...> и лишние отступы.
+        def flatten_pre(m):
+            inner = m.group(1)
+            # убираем обёртку <code class='language-...'>...</code> внутри pre
+            inner = re.sub(r'<code[^>]*>(.*?)</code>', lambda c: c.group(1), inner, flags=re.DOTALL)
+            # strip только внешние переносы
+            inner = inner.strip('\n')
+            lines = inner.split('\n')
+            # минимальный отступ среди непустых строк
+            min_indent = min(
+                (len(l) - len(l.lstrip(' ')) for l in lines if l.strip()),
+                default=0
+            )
+            cleaned = '\n'.join(l[min_indent:] for l in lines)
+            # убираем trailing пробелы в каждой строке
+            cleaned = '\n'.join(l.rstrip() for l in cleaned.split('\n'))
+            cleaned = cleaned.strip('\n')
+            return f'<pre>{cleaned}</pre>'
+        result = re.sub(r'<pre>(.*?)</pre>', flatten_pre, result, flags=re.DOTALL)
+
         return result
 
     except Exception as e:
@@ -145,11 +168,7 @@ def build_prefixed_html(sender_name: str, user_marker: str, msg, edited=False) -
             # Для сообщений с <pre> (таблицы, код):
             # Telethon при unparse оборачивает весь pre-контент так:
             # <pre>строка1\nстрока2...</pre>
-            # Первая строка таблицы оказывается прямо после <pre> — без переноса.
-            # Вставляем \n сразу после каждого открывающего <pre>, чтобы
-            # таблица начиналась с чистой строки и не смещалась.
-            fixed_html = re.sub(r'<pre>(?!\n)', '<pre>\n', original_html)
-            result = f"{header}\n{fixed_html}"
+            result = f"{header}\n{original_html}"
         else:
             result = f"{header}\n{original_html}"
     else:
