@@ -882,16 +882,15 @@ async def send_to_target(
 
         try:
             current_reply_id = reply_to_target_id if attempt == 0 else None
-            send_kwargs = {
+            # Базовые kwargs — общие для всех типов отправки
+            base_kwargs = {
                 "chat_id": target_chat,
                 "message_thread_id": int(current_target_tid),
                 "reply_to_message_id": current_reply_id,
-                "link_preview_options": LinkPreviewOptions(is_disabled=True),
             }
 
             if msg.media:
-                send_kwargs["parse_mode"] = "HTML"
-                send_kwargs["caption"] = prefixed_text
+                send_kwargs = {**base_kwargs, "parse_mode": "HTML", "caption": prefixed_text}
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
                 buf.seek(0)
@@ -907,6 +906,11 @@ async def send_to_target(
                 else:
                     sent = await bot_app.bot.send_document(document=buf, **send_kwargs)
             else:
+                # link_preview_options поддерживается только в send_message
+                send_kwargs = {
+                    **base_kwargs,
+                    "link_preview_options": LinkPreviewOptions(is_disabled=True),
+                }
                 sent = await bot_app.bot.send_message(
                     text=prefixed_text,
                     parse_mode="HTML",
