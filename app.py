@@ -6,7 +6,8 @@ import io
 import re
 import sqlite3
 import logging
-from datetime import datetime, timezone, timedelta
+import zipfile
+from datetime import datetime, timezone, timedelta, time as dt_time
 from html import escape
 from dotenv import load_dotenv
 
@@ -14,7 +15,7 @@ from telethon import TelegramClient, events
 from telethon.extensions import html as telethon_html
 from telethon.tl.types import (
     User, Chat, Channel, MessageActionTopicCreate,
-    MessageMediaPhoto, MessageMediaDocument
+    MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
@@ -53,6 +54,14 @@ LOG_FILE = "bot_messages.log"
 LOG_RETENTION_DAYS = 2
 LOG_EXPORT_HOURS = 24
 KYIV_OFFSET = 3
+
+# ====== BACKUP CONFIG ======
+BACKUP_TIME_HOUR_KYIV = 4  # час низкой активности для ежедневного backup
+
+# ====== БЛОКИРОВКА ДЛЯ ЗАПИСИ В КОНФИГ/БД ПРИ RESTORE ======
+# Защищает от гонок при чтении-изменении-записи topics_mapping.json,
+# а также используется как "стоп-кран" при восстановлении из backup.
+data_lock = asyncio.Lock()
 
 # ====== USER COLOR SYSTEM ======
 
@@ -243,6 +252,12 @@ class DB:
     @staticmethod
     def init():
         with sqlite3.connect(DB_FILE) as conn:
+            # WAL снижает вероятность "database is locked" при параллельном
+            # чтении (например, во время создания backup) и записи.
+            try:
+                conn.execute('PRAGMA journal_mode=WAL')
+            except Exception as e:
+                logger.warning(f"[DB INIT] Не удалось включить WAL: {e}")
             conn.execute(
                 'CREATE TABLE IF NOT EXISTS msg_map '
                 '(src_id INTEGER PRIMARY KEY, tgt_id INTEGER, tid INTEGER, custom_target_id INTEGER)'
@@ -302,6 +317,12 @@ class DB:
 # Новое поле в JSON-конфиге чата: "extra_targets" — список доп. каналов.
 # Каждый элемент: {"chat_id": int, "topics": {"<source_tid>": <target_tid>}}
 # Топики для доп. каналов управляются независимо от основного.
+#
+# ВАЖНО про блокировку: все операции "прочитать JSON -> изменить -> сохранить"
+# либо обёрнуты в data_lock (в методах ниже), либо в местах вызова
+# (callback_handler / handle_admin_text / cmd_bindtopic), чтобы исключить
+# потерю обновлений при параллельной обработке нескольких апдейтов и
+# чтобы файл не мог быть прочитан "наполовину записанным" во время backup/restore.
 
 class TopicManager:
     @staticmethod
@@ -316,8 +337,12 @@ class TopicManager:
 
     @staticmethod
     def save_db(db):
-        with open(TOPICS_DB_FILE, 'w', encoding='utf-8') as f:
+        # Пишем во временный файл и атомарно переименовываем — так исключаем
+        # шанс получить битый/пустой JSON, если процесс упадёт посреди записи.
+        tmp_path = f"{TOPICS_DB_FILE}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(db, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, TOPICS_DB_FILE)
 
     @staticmethod
     def get_status(chat_id, s_tid=0):
@@ -348,38 +373,39 @@ class TopicManager:
         return result
 
     @staticmethod
-    def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
-        db = TopicManager.load_db()
-        c_key, t_key = str(chat_id), str(s_tid or 0)
+    async def register_source(chat_id, title, chat_type, s_tid=0, s_tname=None, target_tid=None):
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key, t_key = str(chat_id), str(s_tid or 0)
 
-        if c_key not in db:
-            default_enabled = False if chat_type == "private" else True
-            db[c_key] = {
-                "title": title,
-                "type": chat_type,
-                "enabled": default_enabled,
-                "custom_target_id": None,
-                "auto_create_topics": True,
-                "extra_targets": [],   # <- список доп. каналов
-                "topics": {}
+            if c_key not in db:
+                default_enabled = False if chat_type == "private" else True
+                db[c_key] = {
+                    "title": title,
+                    "type": chat_type,
+                    "enabled": default_enabled,
+                    "custom_target_id": None,
+                    "auto_create_topics": True,
+                    "extra_targets": [],   # <- список доп. каналов
+                    "topics": {}
+                }
+
+            if "auto_create_topics" not in db[c_key]:
+                db[c_key]["auto_create_topics"] = True
+
+            # Миграция: добавляем поле если его нет в старых записях
+            if "extra_targets" not in db[c_key]:
+                db[c_key]["extra_targets"] = []
+
+            existing_topic = db[c_key]["topics"].get(t_key, {})
+            db[c_key]["topics"][t_key] = {
+                "topic_id": target_tid or existing_topic.get('topic_id'),
+                "title": s_tname or existing_topic.get('title') or (
+                    "Личка" if chat_type == "private" else (f"Thread {t_key}" if t_key != "0" else "Main")
+                ),
+                "enabled": existing_topic.get('enabled', True)
             }
-
-        if "auto_create_topics" not in db[c_key]:
-            db[c_key]["auto_create_topics"] = True
-
-        # Миграция: добавляем поле если его нет в старых записях
-        if "extra_targets" not in db[c_key]:
-            db[c_key]["extra_targets"] = []
-
-        existing_topic = db[c_key]["topics"].get(t_key, {})
-        db[c_key]["topics"][t_key] = {
-            "topic_id": target_tid or existing_topic.get('topic_id'),
-            "title": s_tname or existing_topic.get('title') or (
-                "Личка" if chat_type == "private" else (f"Thread {t_key}" if t_key != "0" else "Main")
-            ),
-            "enabled": existing_topic.get('enabled', True)
-        }
-        TopicManager.save_db(db)
+            TopicManager.save_db(db)
 
     # ------------------------------------------------------------------ #
     # Новые методы для управления дополнительными каналами
@@ -395,47 +421,50 @@ class TopicManager:
         return db.get(str(chat_id), {}).get("extra_targets", [])
 
     @staticmethod
-    def add_extra_target(chat_id: str, extra_chat_id: int) -> bool:
+    async def add_extra_target(chat_id: str, extra_chat_id: int) -> bool:
         """Добавляет доп. канал к источнику. Возвращает False если уже есть."""
-        db = TopicManager.load_db()
-        c_key = str(chat_id)
-        if c_key not in db:
-            return False
-        if "extra_targets" not in db[c_key]:
-            db[c_key]["extra_targets"] = []
-
-        # Проверяем дубликат
-        for et in db[c_key]["extra_targets"]:
-            if et["chat_id"] == extra_chat_id:
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key = str(chat_id)
+            if c_key not in db:
                 return False
+            if "extra_targets" not in db[c_key]:
+                db[c_key]["extra_targets"] = []
 
-        db[c_key]["extra_targets"].append({"chat_id": extra_chat_id, "topics": {}})
-        TopicManager.save_db(db)
-        return True
+            # Проверяем дубликат
+            for et in db[c_key]["extra_targets"]:
+                if et["chat_id"] == extra_chat_id:
+                    return False
+
+            db[c_key]["extra_targets"].append({"chat_id": extra_chat_id, "topics": {}})
+            TopicManager.save_db(db)
+            return True
 
     @staticmethod
-    def remove_extra_target(chat_id: str, extra_chat_id: int):
+    async def remove_extra_target(chat_id: str, extra_chat_id: int):
         """Удаляет доп. канал из источника."""
-        db = TopicManager.load_db()
-        c_key = str(chat_id)
-        if c_key not in db:
-            return
-        db[c_key]["extra_targets"] = [
-            et for et in db[c_key].get("extra_targets", [])
-            if et["chat_id"] != extra_chat_id
-        ]
-        TopicManager.save_db(db)
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key = str(chat_id)
+            if c_key not in db:
+                return
+            db[c_key]["extra_targets"] = [
+                et for et in db[c_key].get("extra_targets", [])
+                if et["chat_id"] != extra_chat_id
+            ]
+            TopicManager.save_db(db)
 
     @staticmethod
-    def set_extra_topic(chat_id: str, extra_chat_id: int, s_tid: str, t_tid: int):
+    async def set_extra_topic(chat_id: str, extra_chat_id: int, s_tid: str, t_tid: int):
         """Сохраняет маппинг топика для конкретного доп. канала."""
-        db = TopicManager.load_db()
-        c_key = str(chat_id)
-        for et in db.get(c_key, {}).get("extra_targets", []):
-            if et["chat_id"] == extra_chat_id:
-                et["topics"][str(s_tid)] = t_tid
-                TopicManager.save_db(db)
-                return
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key = str(chat_id)
+            for et in db.get(c_key, {}).get("extra_targets", []):
+                if et["chat_id"] == extra_chat_id:
+                    et["topics"][str(s_tid)] = t_tid
+                    TopicManager.save_db(db)
+                    return
 
     @staticmethod
     def get_extra_topic(chat_id: str, extra_chat_id: int, s_tid) -> int | None:
@@ -479,6 +508,147 @@ def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
             return candidate
 
     return 0
+
+# ====== BACKUP / RESTORE ======
+
+async def create_backup_archive() -> str | None:
+    """
+    Создаёт zip с bot_data.db и topics_mapping.json.
+    Использует sqlite backup API, чтобы не словить corruption при
+    параллельной записи в БД во время бэкапа.
+    """
+    timestamp = get_now_kyiv().strftime('%Y%m%d_%H%M%S')
+    archive_path = f"backup_{timestamp}.zip"
+    tmp_db_copy = f"_backup_tmp_{timestamp}.db"
+
+    try:
+        src_conn = sqlite3.connect(DB_FILE)
+        dst_conn = sqlite3.connect(tmp_db_copy)
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        src_conn.close()
+        dst_conn.close()
+
+        # topics_mapping.json читаем под тем же локом, что и запись,
+        # чтобы точно не захватить файл в процессе перезаписи.
+        async with data_lock:
+            with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                if os.path.exists(tmp_db_copy):
+                    zf.write(tmp_db_copy, arcname='bot_data.db')
+                if os.path.exists(TOPICS_DB_FILE):
+                    zf.write(TOPICS_DB_FILE, arcname=TOPICS_DB_FILE)
+
+        return archive_path
+    except Exception as e:
+        logger.error(f"[BACKUP ERROR] {e}")
+        return None
+    finally:
+        if os.path.exists(tmp_db_copy):
+            try:
+                os.remove(tmp_db_copy)
+            except Exception:
+                pass
+
+async def send_backup(bot, chat_id: int):
+    archive_path = await create_backup_archive()
+    if not archive_path:
+        await bot.send_message(chat_id=chat_id, text="❌ Не удалось создать backup.")
+        return
+    try:
+        with open(archive_path, "rb") as f:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=os.path.basename(archive_path),
+                caption=f"💾 Backup от {get_now_kyiv().strftime('%d.%m.%Y %H:%M')} (Киев)"
+            )
+    except Exception as e:
+        logger.error(f"[BACKUP SEND ERROR] {e}")
+        await bot.send_message(chat_id=chat_id, text=f"❌ Ошибка отправки backup: {e}")
+    finally:
+        if os.path.exists(archive_path):
+            try:
+                os.remove(archive_path)
+            except Exception:
+                pass
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text("⏳ Собираю backup...")
+    await send_backup(context.bot, ADMIN_ID)
+
+async def scheduled_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("[BACKUP] Запуск ежедневного backup по расписанию")
+    await send_backup(context.bot, ADMIN_ID)
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    user_edit_state[ADMIN_ID] = {"mode": "restore_backup"}
+    await update.message.reply_text(
+        "⚠️ Отправьте .zip файл backup для восстановления.\n\n"
+        "Перед перезаписью я автоматически сделаю резервную копию "
+        "текущих данных — если что-то пойдёт не так, можно будет откатиться."
+    )
+
+async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID or user_edit_state.get(user_id, {}).get("mode") != "restore_backup":
+        return
+
+    user_edit_state.pop(user_id, None)
+    doc = update.message.document
+
+    if not doc or not (doc.file_name or "").lower().endswith(".zip"):
+        await update.message.reply_text("❌ Нужен .zip файл backup (созданный через /backup).")
+        return
+
+    tmp_zip = f"_restore_tmp_{get_now_kyiv().strftime('%Y%m%d_%H%M%S')}.zip"
+    try:
+        await update.message.reply_text("⏳ Скачиваю и проверяю архив...")
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(tmp_zip)
+
+        with zipfile.ZipFile(tmp_zip, 'r') as zf:
+            names = zf.namelist()
+            if 'bot_data.db' not in names or TOPICS_DB_FILE not in names:
+                await update.message.reply_text(
+                    "❌ Архив не содержит нужных файлов (bot_data.db и/или topics_mapping.json)."
+                )
+                return
+
+            # safety backup перед перезаписью текущих данных
+            safety_path = await create_backup_archive()
+            if safety_path:
+                logger.info(f"[RESTORE] Safety backup перед восстановлением сохранён: {safety_path}")
+                try:
+                    os.remove(safety_path)
+                except Exception:
+                    pass
+
+            async with data_lock:
+                zf.extract('bot_data.db', path='.')
+                zf.extract(TOPICS_DB_FILE, path='.')
+
+        DB.init()
+        await update.message.reply_text(
+            "✅ Восстановление завершено. Данные подхватятся автоматически "
+            "(перезапуск бота не обязателен, но рекомендуется на всякий случай)."
+        )
+        logger.info("[RESTORE] Восстановление из backup выполнено успешно")
+
+    except zipfile.BadZipFile:
+        await update.message.reply_text("❌ Файл повреждён или это не zip-архив.")
+    except Exception as e:
+        logger.error(f"[RESTORE ERROR] {e}")
+        await update.message.reply_text(f"❌ Ошибка восстановления: {e}")
+    finally:
+        if os.path.exists(tmp_zip):
+            try:
+                os.remove(tmp_zip)
+            except Exception:
+                pass
 
 # ====== ИНТЕРФЕЙС УПРАВЛЕНИЯ ======
 
@@ -546,10 +716,10 @@ async def show_manage_menu(query, cid, db):
         for tid, tdata in cdata.get('topics', {}).items():
             t_enabled = tdata.get('enabled', True)
             t_status = "🟢" if t_enabled else "🔴"
-            t_title = tdata.get('title', 'Без названия')
+            t_title = escape_md(tdata.get('title', 'Без названия'))
             target_id = tdata.get('topic_id', '???')
 
-            btn_display = f"{t_status} {t_title} ({tid}) ➡️ {target_id}"
+            btn_display = f"{t_status} {tdata.get('title', 'Без названия')} ({tid}) ➡️ {target_id}"
             keyboard.append([InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}")])
             keyboard.append([
                 InlineKeyboardButton(
@@ -639,32 +809,33 @@ async def cmd_bindtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ target_topic_id должен быть больше 0.")
         return
     try:
-        db = TopicManager.load_db()
-        c_key = str(source_chat_id)
-        t_key = str(source_topic_id)
-        if c_key not in db:
-            db[c_key] = {
-                "title": f"ManualBind {source_chat_id}",
-                "type": "channel",
-                "enabled": True,
-                "custom_target_id": None,
-                "auto_create_topics": True,
-                "extra_targets": [],
-                "topics": {}
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key = str(source_chat_id)
+            t_key = str(source_topic_id)
+            if c_key not in db:
+                db[c_key] = {
+                    "title": f"ManualBind {source_chat_id}",
+                    "type": "channel",
+                    "enabled": True,
+                    "custom_target_id": None,
+                    "auto_create_topics": True,
+                    "extra_targets": [],
+                    "topics": {}
+                }
+            if "topics" not in db[c_key]:
+                db[c_key]["topics"] = {}
+            if "auto_create_topics" not in db[c_key]:
+                db[c_key]["auto_create_topics"] = True
+            if "extra_targets" not in db[c_key]:
+                db[c_key]["extra_targets"] = []
+            existing_topic = db[c_key]["topics"].get(t_key, {})
+            db[c_key]["topics"][t_key] = {
+                "topic_id": target_topic_id,
+                "title": existing_topic.get("title") or f"Thread {source_topic_id}",
+                "enabled": existing_topic.get("enabled", True)
             }
-        if "topics" not in db[c_key]:
-            db[c_key]["topics"] = {}
-        if "auto_create_topics" not in db[c_key]:
-            db[c_key]["auto_create_topics"] = True
-        if "extra_targets" not in db[c_key]:
-            db[c_key]["extra_targets"] = []
-        existing_topic = db[c_key]["topics"].get(t_key, {})
-        db[c_key]["topics"][t_key] = {
-            "topic_id": target_topic_id,
-            "title": existing_topic.get("title") or f"Thread {source_topic_id}",
-            "enabled": existing_topic.get("enabled", True)
-        }
-        TopicManager.save_db(db)
+            TopicManager.save_db(db)
         logger.info(
             f"[MANUAL BIND] source_chat_id={source_chat_id}, "
             f"source_topic_id={source_topic_id}, target_topic_id={target_topic_id}"
@@ -687,10 +858,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
-    db = TopicManager.load_db()
     data = query.data
 
     if data in ["list_groups", "list_privates"]:
+        db = TopicManager.load_db()
         target_priv = (data == "list_privates")
         kb = [
             [InlineKeyboardButton(
@@ -708,20 +879,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("manage_"):
+        db = TopicManager.load_db()
         await show_manage_menu(query, data.split("_", 1)[1], db)
 
     elif data.startswith("tgc_"):
         cid = data.split("_", 1)[1]
-        db[cid]['enabled'] = not db[cid]['enabled']
-        TopicManager.save_db(db)
+        async with data_lock:
+            db = TopicManager.load_db()
+            if cid in db:
+                db[cid]['enabled'] = not db[cid]['enabled']
+                TopicManager.save_db(db)
+        db = TopicManager.load_db()
         await show_manage_menu(query, cid, db)
 
     elif data.startswith("tat_"):
         cid = data.split("_", 1)[1]
-        if cid in db:
-            current = db[cid].get("auto_create_topics", True)
-            db[cid]["auto_create_topics"] = not current
-            TopicManager.save_db(db)
+        async with data_lock:
+            db = TopicManager.load_db()
+            if cid in db:
+                current = db[cid].get("auto_create_topics", True)
+                db[cid]["auto_create_topics"] = not current
+                TopicManager.save_db(db)
+        db = TopicManager.load_db()
         await show_manage_menu(query, cid, db)
 
     elif data.startswith("editchat_"):
@@ -745,8 +924,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_", 2)
         cid = parts[1]
         extra_chat_id = int(parts[2])
-        TopicManager.remove_extra_target(cid, extra_chat_id)
-        db = TopicManager.load_db()  # перечитываем после изменения
+        await TopicManager.remove_extra_target(cid, extra_chat_id)
+        db = TopicManager.load_db()
         await show_manage_menu(query, cid, db)
 
     elif data.startswith("editid_"):
@@ -758,17 +937,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("del_"):
         _, cid, tid = data.split("_", 2)
-        if cid in db and tid in db[cid].get('topics', {}):
-            del db[cid]['topics'][tid]
-            TopicManager.save_db(db)
-            await show_manage_menu(query, cid, db)
+        async with data_lock:
+            db = TopicManager.load_db()
+            if cid in db and tid in db[cid].get('topics', {}):
+                del db[cid]['topics'][tid]
+                TopicManager.save_db(db)
+        db = TopicManager.load_db()
+        await show_manage_menu(query, cid, db)
 
     elif data.startswith("tgt_"):
         _, cid, tid = data.split("_", 2)
-        if cid in db and tid in db[cid].get('topics', {}):
-            current = db[cid]['topics'][tid].get('enabled', True)
-            db[cid]['topics'][tid]['enabled'] = not current
-            TopicManager.save_db(db)
+        async with data_lock:
+            db = TopicManager.load_db()
+            if cid in db and tid in db[cid].get('topics', {}):
+                current = db[cid]['topics'][tid].get('enabled', True)
+                db[cid]['topics'][tid]['enabled'] = not current
+                TopicManager.save_db(db)
+        db = TopicManager.load_db()
         await show_manage_menu(query, cid, db)
 
     elif data == "main_menu":
@@ -781,20 +966,25 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = user_edit_state.pop(user_id)
     new_input = update.message.text.strip()
-    db = TopicManager.load_db()
     cid = state["cid"]
+    text = None
 
     if state["mode"] == "target_chat":
         if new_input == "0":
-            db[cid]['custom_target_id'] = None
+            new_val = None
             text = "✅ Теперь используются настройки по умолчанию."
         else:
             try:
-                db[cid]['custom_target_id'] = int(new_input)
+                new_val = int(new_input)
                 text = f"✅ Основной канал назначения изменён на `{new_input}`"
-            except:
+            except ValueError:
                 await update.message.reply_text("❌ Ошибка: Введите корректный ID (число).")
                 return
+        async with data_lock:
+            db = TopicManager.load_db()
+            if cid in db:
+                db[cid]['custom_target_id'] = new_val
+                TopicManager.save_db(db)
 
     elif state["mode"] == "add_extra_target":
         try:
@@ -802,7 +992,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Ошибка: Введите корректный ID (число).")
             return
-        added = TopicManager.add_extra_target(cid, extra_chat_id)
+        added = await TopicManager.add_extra_target(cid, extra_chat_id)
         if added:
             text = (
                 f"✅ Дополнительный канал `{extra_chat_id}` добавлен.\n"
@@ -813,14 +1003,19 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif state["mode"] == "topic_id":
         tid = state["tid"]
-        if new_input.isdigit():
-            db[cid]['topics'][tid]['topic_id'] = int(new_input)
-            text = f"✅ Новый Target ID для ветки `{tid}` установлен: `{new_input}`"
-        else:
+        if not new_input.isdigit():
             await update.message.reply_text("❌ Ошибка: Введите число.")
             return
+        async with data_lock:
+            db = TopicManager.load_db()
+            if cid in db and tid in db[cid].get('topics', {}):
+                db[cid]['topics'][tid]['topic_id'] = int(new_input)
+                TopicManager.save_db(db)
+        text = f"✅ Новый Target ID для ветки `{tid}` установлен: `{new_input}`"
 
-    TopicManager.save_db(db)
+    if text is None:
+        return
+
     await update.message.reply_text(text + "\nИспользуйте /list для управления.")
 
 # ====== CORE SEND LOGIC ======
@@ -850,6 +1045,10 @@ async def send_to_target(
     """
 
     current_target_tid = target_tid
+    # MessageMediaWebPage — это линк-превью (обычная ссылка в тексте), а не файл.
+    # msg.media для таких сообщений truthy, но download_media ничего не вернёт,
+    # и попытка отправить это как document/photo даёт ошибку "File must be non-empty".
+    has_downloadable_media = bool(msg.media) and not isinstance(msg.media, MessageMediaWebPage)
 
     for attempt in range(2):
         if not current_target_tid:
@@ -873,9 +1072,9 @@ async def send_to_target(
             current_target_tid = new_tid
 
             if is_extra:
-                TopicManager.set_extra_topic(chat_id_str, target_chat, str(source_top_id), new_tid)
+                await TopicManager.set_extra_topic(chat_id_str, target_chat, str(source_top_id), new_tid)
             else:
-                TopicManager.register_source(
+                await TopicManager.register_source(
                     int(chat_id_str), chat_title, chat_type,
                     source_top_id, s_tname=source_topic_title, target_tid=new_tid
                 )
@@ -889,7 +1088,7 @@ async def send_to_target(
                 "reply_to_message_id": current_reply_id,
             }
 
-            if msg.media:
+            if has_downloadable_media:
                 send_kwargs = {**base_kwargs, "parse_mode": "HTML", "caption": prefixed_text}
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
@@ -933,12 +1132,13 @@ async def send_to_target(
                     f"Ветка {current_target_tid} невалидна. Пересоздаю..."
                 )
                 if is_extra:
-                    TopicManager.set_extra_topic(chat_id_str, target_chat, str(source_top_id), None)
+                    await TopicManager.set_extra_topic(chat_id_str, target_chat, str(source_top_id), None)
                 else:
-                    db_data = TopicManager.load_db()
-                    if chat_id_str in db_data and str(source_top_id) in db_data[chat_id_str]['topics']:
-                        db_data[chat_id_str]['topics'][str(source_top_id)]['topic_id'] = None
-                        TopicManager.save_db(db_data)
+                    async with data_lock:
+                        db_data = TopicManager.load_db()
+                        if chat_id_str in db_data and str(source_top_id) in db_data[chat_id_str]['topics']:
+                            db_data[chat_id_str]['topics'][str(source_top_id)]['topic_id'] = None
+                            TopicManager.save_db(db_data)
                 current_target_tid = None
                 continue
             elif "reply" in err_str.lower() or "Message to be replied not found" in err_str:
@@ -1034,7 +1234,7 @@ async def telethon_handler(event):
 
     # ===== Ранний выход для новых приватных чатов =====
     if not target_tid and status == "new" and is_private:
-        TopicManager.register_source(chat.id, chat_title, "private", 0)
+        await TopicManager.register_source(chat.id, chat_title, "private", 0)
         return
 
     if not target_tid and msg.reply_to and source_top_id == 0:
@@ -1164,7 +1364,7 @@ async def telethon_edit_handler(event):
 async def _edit_message(target_chat: int, target_msg_id: int, msg, updated_text: str):
     """Вспомогательная функция: редактирует одно сообщение в одном канале."""
     try:
-        if msg.media:
+        if msg.media and not isinstance(msg.media, MessageMediaWebPage):
             await bot_app.bot.edit_message_caption(
                 chat_id=target_chat,
                 message_id=target_msg_id,
@@ -1226,11 +1426,28 @@ async def main():
     bot_app.add_handler(CommandHandler("list", cmd_list))
     bot_app.add_handler(CommandHandler("log", cmd_log))
     bot_app.add_handler(CommandHandler("bindtopic", cmd_bindtopic))
+    bot_app.add_handler(CommandHandler("backup", cmd_backup))
+    bot_app.add_handler(CommandHandler("restore", cmd_restore))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
+    bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_document))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
 
     await bot_app.initialize()
     await bot_app.start()
+
+    if bot_app.job_queue:
+        backup_time = dt_time(
+            hour=BACKUP_TIME_HOUR_KYIV, minute=0,
+            tzinfo=timezone(timedelta(hours=KYIV_OFFSET))
+        )
+        bot_app.job_queue.run_daily(scheduled_backup_job, time=backup_time, name="daily_backup")
+        logger.info(f"[BACKUP] Ежедневный backup запланирован на {BACKUP_TIME_HOUR_KYIV}:00 (Киев)")
+    else:
+        logger.warning(
+            "[BACKUP] JobQueue недоступен — установите: "
+            'pip install "python-telegram-bot[job-queue]" для автобэкапа по расписанию. '
+            "Ручной /backup продолжит работать."
+        )
 
     client = TelegramClient('support_session', API_ID, API_HASH)
     client.add_event_handler(telethon_handler, events.NewMessage())
