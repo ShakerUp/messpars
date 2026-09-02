@@ -7,12 +7,15 @@ import re
 import sqlite3
 import logging
 import zipfile
+import random
 from datetime import datetime, timezone, timedelta, time as dt_time
 from html import escape
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 from telethon.extensions import html as telethon_html
+from telethon.tl.functions.account import UpdateStatusRequest
 from telethon.tl.types import (
     User, Chat, Channel, MessageActionTopicCreate,
     MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
@@ -58,6 +61,15 @@ KYIV_OFFSET = 3
 # ====== BACKUP CONFIG ======
 BACKUP_TIME_HOUR_KYIV = 4  # час низкой активности для ежедневного backup
 
+# ====== PRESENCE EMULATION CONFIG ======
+# Держит user-аккаунт Telethon "online" днем и переводит в "offline" ночью.
+PRESENCE_ENABLED = os.getenv("PRESENCE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+PRESENCE_ONLINE_FROM_KYIV = os.getenv("PRESENCE_ONLINE_FROM_KYIV", "08:00")
+PRESENCE_ONLINE_UNTIL_KYIV = os.getenv("PRESENCE_ONLINE_UNTIL_KYIV", "23:30")
+PRESENCE_REFRESH_SECONDS = int(os.getenv("PRESENCE_REFRESH_SECONDS", "75"))
+PRESENCE_NIGHT_CHECK_SECONDS = int(os.getenv("PRESENCE_NIGHT_CHECK_SECONDS", "600"))
+PRESENCE_JITTER_SECONDS = int(os.getenv("PRESENCE_JITTER_SECONDS", "15"))
+
 # ====== БЛОКИРОВКА ДЛЯ ЗАПИСИ В КОНФИГ/БД ПРИ RESTORE ======
 # Защищает от гонок при чтении-изменении-записи topics_mapping.json,
 # а также используется как "стоп-кран" при восстановлении из backup.
@@ -87,6 +99,70 @@ EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), DEFAULT_TARGET_CHAT_ID] + SYST
 
 def get_now_kyiv():
     return datetime.now(timezone.utc) + timedelta(hours=KYIV_OFFSET)
+
+def parse_hhmm(value: str, default: str) -> dt_time:
+    try:
+        hour_str, minute_str = value.strip().split(":", 1)
+        return dt_time(hour=int(hour_str), minute=int(minute_str))
+    except Exception:
+        logger.warning(f"[PRESENCE] Некорректное время '{value}', использую {default}")
+        hour_str, minute_str = default.split(":", 1)
+        return dt_time(hour=int(hour_str), minute=int(minute_str))
+
+def is_presence_daytime(now_kyiv: datetime | None = None) -> bool:
+    now_kyiv = now_kyiv or get_now_kyiv()
+    now_time = now_kyiv.time()
+    start = parse_hhmm(PRESENCE_ONLINE_FROM_KYIV, "08:00")
+    end = parse_hhmm(PRESENCE_ONLINE_UNTIL_KYIV, "23:30")
+
+    if start <= end:
+        return start <= now_time < end
+    return now_time >= start or now_time < end
+
+async def set_account_presence(online: bool):
+    if not client:
+        return
+    await client(UpdateStatusRequest(offline=not online))
+
+async def presence_emulation_loop():
+    if not PRESENCE_ENABLED:
+        logger.info("[PRESENCE] Эмуляция online отключена")
+        return
+
+    last_online_state = None
+    logger.info(
+        "[PRESENCE] Эмуляция online активна: "
+        f"{PRESENCE_ONLINE_FROM_KYIV}-{PRESENCE_ONLINE_UNTIL_KYIV} (Киев)"
+    )
+
+    while True:
+        try:
+            should_be_online = is_presence_daytime()
+            await set_account_presence(should_be_online)
+
+            if should_be_online:
+                if last_online_state is not True:
+                    logger.info("[PRESENCE] Аккаунт переведен в online")
+                base_sleep = PRESENCE_REFRESH_SECONDS
+                jitter = random.randint(-PRESENCE_JITTER_SECONDS, PRESENCE_JITTER_SECONDS)
+                sleep_for = max(30, base_sleep + jitter)
+            else:
+                if last_online_state is not False:
+                    logger.info("[PRESENCE] Ночное окно: аккаунт переведен в offline")
+                sleep_for = PRESENCE_NIGHT_CHECK_SECONDS
+
+            last_online_state = should_be_online
+            await asyncio.sleep(sleep_for)
+
+        except FloodWaitError as e:
+            wait_for = int(getattr(e, "seconds", 60)) + 5
+            logger.warning(f"[PRESENCE] FloodWait, пауза {wait_for} сек")
+            await asyncio.sleep(wait_for)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[PRESENCE ERROR] {e}")
+            await asyncio.sleep(300)
 
 def render_message_html(msg) -> str:
     """
@@ -1454,11 +1530,24 @@ async def main():
     client.add_event_handler(telethon_edit_handler, events.MessageEdited())
 
     await client.start()
+    presence_task = asyncio.create_task(presence_emulation_loop())
     logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
-    async with bot_app:
-        await bot_app.updater.start_polling()
-        await client.run_until_disconnected()
+    try:
+        async with bot_app:
+            await bot_app.updater.start_polling()
+            await client.run_until_disconnected()
+    finally:
+        presence_task.cancel()
+        try:
+            await presence_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await set_account_presence(False)
+            logger.info("[PRESENCE] Аккаунт переведен в offline перед остановкой")
+        except Exception as e:
+            logger.warning(f"[PRESENCE] Не удалось перевести аккаунт в offline при остановке: {e}")
 
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
