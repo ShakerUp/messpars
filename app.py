@@ -544,6 +544,22 @@ class TopicManager:
             }
             TopicManager.save_db(db)
 
+    @staticmethod
+    async def set_topic_title(chat_id, s_tid, title: str):
+        clean_title = (title or "").strip()
+        if not clean_title:
+            return
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key, t_key = str(chat_id), str(s_tid or 0)
+            if c_key not in db or t_key not in db[c_key].get("topics", {}):
+                return
+            current_title = db[c_key]["topics"][t_key].get("title")
+            if current_title == clean_title:
+                return
+            db[c_key]["topics"][t_key]["title"] = clean_title
+            TopicManager.save_db(db)
+
     # ------------------------------------------------------------------ #
     # Новые методы для управления дополнительными каналами
     # ------------------------------------------------------------------ #
@@ -687,7 +703,7 @@ class ForumManager:
     @staticmethod
     async def create_topic(target_chat, chat_title, s_tname=None):
         try:
-            name = (f"{s_tname} | {chat_title}" if s_tname else f"💬 {chat_title}")[:120]
+            name = (s_tname if s_tname else f"💬 {chat_title}")[:120]
             res = await bot_app.bot.create_forum_topic(chat_id=target_chat, name=name)
             tid = res.message_thread_id
             logger.info(f"[FORUM] Создан новый топик '{name}' ID: {tid} в чате {target_chat}")
@@ -695,6 +711,53 @@ class ForumManager:
         except Exception as e:
             logger.error(f"[FORUM ERROR] Ошибка создания топика: {e}")
             return None
+
+def extract_topic_create_title(msg) -> str | None:
+    action = getattr(msg, "action", None)
+    if isinstance(action, MessageActionTopicCreate):
+        title = getattr(action, "title", None)
+        if title:
+            return str(title).strip()
+    return None
+
+def is_generic_topic_title(title: str | None, topic_id) -> bool:
+    if not title:
+        return True
+    normalized = str(title).strip()
+    return normalized in {"Main", "Личка", f"Thread {topic_id}"}
+
+async def get_source_topic_title(chat, source_top_id, chat_conf=None, msg=None) -> str | None:
+    if not source_top_id or int(source_top_id) <= 0:
+        return None
+
+    t_key = str(source_top_id)
+    stored_title = (chat_conf or {}).get("topics", {}).get(t_key, {}).get("title")
+    if not is_generic_topic_title(stored_title, source_top_id):
+        return stored_title
+
+    title = extract_topic_create_title(msg)
+    if title:
+        return title
+
+    try:
+        from telethon.tl.functions.channels import GetForumTopicsByIDRequest
+        res = await client(GetForumTopicsByIDRequest(channel=chat, topics=[int(source_top_id)]))
+        if res and getattr(res, "topics", None):
+            title = getattr(res.topics[0], "title", None)
+            if title:
+                return str(title).strip()
+    except Exception as e:
+        logger.warning(f"[TOPIC TITLE API ERROR] {e}")
+
+    try:
+        topic_start_msg = await client.get_messages(chat, ids=int(source_top_id))
+        title = extract_topic_create_title(topic_start_msg)
+        if title:
+            return title
+    except Exception as e:
+        logger.warning(f"[TOPIC TITLE MESSAGE ERROR] {e}")
+
+    return None
 
 def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
     if getattr(msg, 'message_thread_id', None):
@@ -1563,16 +1626,16 @@ async def telethon_handler(event):
         logger.info(f"[SKIP] Message {msg.id} skipped because topic {source_top_id} is disabled")
         return
 
-    # ===== Название ветки (для автосоздания) =====
+    # ===== Название ветки (для автосоздания и обновления старых generic-имен) =====
     source_topic_title = None
-    if not is_private and source_top_id and int(source_top_id) > 0 and not target_tid:
-        try:
-            from telethon.tl.functions.channels import GetForumTopicsByIDRequest
-            res = await client(GetForumTopicsByIDRequest(channel=chat, topics=[int(source_top_id)]))
-            if res and getattr(res, "topics", None):
-                source_topic_title = getattr(res.topics[0], "title", None)
-        except Exception as e:
-            logger.warning(f"[TOPIC TITLE ERROR] {e}")
+    if not is_private and source_top_id and int(source_top_id) > 0:
+        source_topic_title = await get_source_topic_title(chat, source_top_id, chat_conf, msg=msg)
+        if source_topic_title:
+            stored_title = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('title')
+            if is_generic_topic_title(stored_title, source_top_id):
+                await TopicManager.set_topic_title(chat.id, source_top_id, source_topic_title)
+                chat_conf = TopicManager.load_db().get(chat_id_str, chat_conf)
+            logger.info(f"[TOPIC TITLE] source_topic={source_top_id}, title={source_topic_title}")
 
     # ===== Текст =====
     prefixed_text = build_prefixed_html(sender_name, user_marker, msg, edited=False)
