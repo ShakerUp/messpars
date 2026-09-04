@@ -50,6 +50,7 @@ DEFAULT_TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
 ADMIN_ID = 684460638
 
 TOPICS_DB_FILE = 'topics_mapping.json'
+BOT_SETTINGS_FILE = 'bot_settings.json'
 DB_FILE = 'bot_data.db'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
@@ -69,6 +70,12 @@ PRESENCE_ONLINE_UNTIL_KYIV = os.getenv("PRESENCE_ONLINE_UNTIL_KYIV", "23:30")
 PRESENCE_REFRESH_SECONDS = int(os.getenv("PRESENCE_REFRESH_SECONDS", "75"))
 PRESENCE_NIGHT_CHECK_SECONDS = int(os.getenv("PRESENCE_NIGHT_CHECK_SECONDS", "600"))
 PRESENCE_JITTER_SECONDS = int(os.getenv("PRESENCE_JITTER_SECONDS", "15"))
+
+DEFAULT_BOT_SETTINGS = {
+    "presence_enabled": PRESENCE_ENABLED,
+    "presence_online_from": PRESENCE_ONLINE_FROM_KYIV,
+    "presence_online_until": PRESENCE_ONLINE_UNTIL_KYIV,
+}
 
 # ====== БЛОКИРОВКА ДЛЯ ЗАПИСИ В КОНФИГ/БД ПРИ RESTORE ======
 # Защищает от гонок при чтении-изменении-записи topics_mapping.json,
@@ -100,6 +107,30 @@ EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), DEFAULT_TARGET_CHAT_ID] + SYST
 def get_now_kyiv():
     return datetime.now(timezone.utc) + timedelta(hours=KYIV_OFFSET)
 
+def load_bot_settings() -> dict:
+    settings = DEFAULT_BOT_SETTINGS.copy()
+    if not os.path.exists(BOT_SETTINGS_FILE):
+        return settings
+    try:
+        with open(BOT_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            settings.update({k: saved[k] for k in settings.keys() if k in saved})
+    except Exception as e:
+        logger.warning(f"[BOT SETTINGS] Не удалось прочитать {BOT_SETTINGS_FILE}: {e}")
+    settings["presence_enabled"] = bool(settings.get("presence_enabled"))
+    settings["presence_online_from"] = str(settings.get("presence_online_from") or "08:00")
+    settings["presence_online_until"] = str(settings.get("presence_online_until") or "23:30")
+    return settings
+
+def save_bot_settings(settings: dict):
+    current = load_bot_settings()
+    current.update({k: settings[k] for k in DEFAULT_BOT_SETTINGS.keys() if k in settings})
+    tmp_path = f"{BOT_SETTINGS_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, BOT_SETTINGS_FILE)
+
 def parse_hhmm(value: str, default: str) -> dt_time:
     try:
         hour_str, minute_str = value.strip().split(":", 1)
@@ -109,11 +140,20 @@ def parse_hhmm(value: str, default: str) -> dt_time:
         hour_str, minute_str = default.split(":", 1)
         return dt_time(hour=int(hour_str), minute=int(minute_str))
 
-def is_presence_daytime(now_kyiv: datetime | None = None) -> bool:
+def parse_presence_time_range(text: str) -> tuple[str, str] | None:
+    matches = re.findall(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if len(matches) < 2:
+        return None
+    start = f"{int(matches[0][0]):02d}:{int(matches[0][1]):02d}"
+    end = f"{int(matches[1][0]):02d}:{int(matches[1][1]):02d}"
+    return start, end
+
+def is_presence_daytime(now_kyiv: datetime | None = None, settings: dict | None = None) -> bool:
+    settings = settings or load_bot_settings()
     now_kyiv = now_kyiv or get_now_kyiv()
     now_time = now_kyiv.time()
-    start = parse_hhmm(PRESENCE_ONLINE_FROM_KYIV, "08:00")
-    end = parse_hhmm(PRESENCE_ONLINE_UNTIL_KYIV, "23:30")
+    start = parse_hhmm(settings.get("presence_online_from", "08:00"), "08:00")
+    end = parse_hhmm(settings.get("presence_online_until", "23:30"), "23:30")
 
     if start <= end:
         return start <= now_time < end
@@ -125,24 +165,30 @@ async def set_account_presence(online: bool):
     await client(UpdateStatusRequest(offline=not online))
 
 async def presence_emulation_loop():
-    if not PRESENCE_ENABLED:
-        logger.info("[PRESENCE] Эмуляция online отключена")
-        return
-
     last_online_state = None
-    logger.info(
-        "[PRESENCE] Эмуляция online активна: "
-        f"{PRESENCE_ONLINE_FROM_KYIV}-{PRESENCE_ONLINE_UNTIL_KYIV} (Киев)"
-    )
+    logger.info("[PRESENCE] Фоновая задача эмуляции online запущена")
 
     while True:
         try:
-            should_be_online = is_presence_daytime()
+            settings = load_bot_settings()
+
+            if not settings.get("presence_enabled", True):
+                if last_online_state != "disabled":
+                    await set_account_presence(False)
+                    logger.info("[PRESENCE] Эмуляция выключена в настройках, аккаунт переведен в offline")
+                last_online_state = "disabled"
+                await asyncio.sleep(60)
+                continue
+
+            should_be_online = is_presence_daytime(settings=settings)
             await set_account_presence(should_be_online)
 
             if should_be_online:
                 if last_online_state is not True:
-                    logger.info("[PRESENCE] Аккаунт переведен в online")
+                    logger.info(
+                        "[PRESENCE] Аккаунт переведен в online "
+                        f"({settings['presence_online_from']}-{settings['presence_online_until']} Киев)"
+                    )
                 base_sleep = PRESENCE_REFRESH_SECONDS
                 jitter = random.randint(-PRESENCE_JITTER_SECONDS, PRESENCE_JITTER_SECONDS)
                 sleep_for = max(30, base_sleep + jitter)
@@ -613,6 +659,8 @@ async def create_backup_archive() -> str | None:
                     zf.write(tmp_db_copy, arcname='bot_data.db')
                 if os.path.exists(TOPICS_DB_FILE):
                     zf.write(TOPICS_DB_FILE, arcname=TOPICS_DB_FILE)
+                if os.path.exists(BOT_SETTINGS_FILE):
+                    zf.write(BOT_SETTINGS_FILE, arcname=BOT_SETTINGS_FILE)
 
         return archive_path
     except Exception as e:
@@ -706,6 +754,8 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
             async with data_lock:
                 zf.extract('bot_data.db', path='.')
                 zf.extract(TOPICS_DB_FILE, path='.')
+                if BOT_SETTINGS_FILE in names:
+                    zf.extract(BOT_SETTINGS_FILE, path='.')
 
         DB.init()
         await update.message.reply_text(
@@ -814,12 +864,41 @@ async def show_manage_menu(query, cid, db):
         parse_mode='Markdown'
     )
 
+async def show_bot_menu(query):
+    settings = load_bot_settings()
+    presence_enabled = settings.get("presence_enabled", True)
+    schedule_from = settings.get("presence_online_from", "08:00")
+    schedule_until = settings.get("presence_online_until", "23:30")
+    should_be_online = presence_enabled and is_presence_daytime(settings=settings)
+
+    text = "🤖 **Бот**\n\n"
+    text += f"Online-эмуляция: {'✅ ВКЛ' if presence_enabled else '⛔ ВЫКЛ'}\n"
+    text += f"Расписание online: `{schedule_from}` — `{schedule_until}` (Киев)\n"
+    text += f"Сейчас по настройкам: {'🟢 online' if should_be_online else '⚫ offline'}\n\n"
+    text += "Чтобы изменить время, нажмите кнопку ниже и отправьте диапазон, например `08:00 23:30`."
+
+    keyboard = [
+        [InlineKeyboardButton(
+            "⛔ ВЫКЛЮЧИТЬ ONLINE" if presence_enabled else "🟢 ВКЛЮЧИТЬ ONLINE",
+            callback_data="bot_presence_toggle"
+        )],
+        [InlineKeyboardButton("🕘 ИЗМЕНИТЬ ВРЕМЯ ONLINE", callback_data="bot_presence_time")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+    ]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     keyboard = [
         [InlineKeyboardButton("👥 ГРУППЫ И КАНАЛЫ", callback_data="list_groups")],
-        [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")]
+        [InlineKeyboardButton("👤 ЛИЧНЫЕ СООБЩЕНИЯ", callback_data="list_privates")],
+        [InlineKeyboardButton("🤖 БОТ", callback_data="bot_settings")]
     ]
     text = "📂 **Главное меню:**"
     if update.callback_query:
@@ -954,6 +1033,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
+    elif data == "bot_settings":
+        await show_bot_menu(query)
+
+    elif data == "bot_presence_toggle":
+        settings = load_bot_settings()
+        settings["presence_enabled"] = not settings.get("presence_enabled", True)
+        save_bot_settings(settings)
+
+        try:
+            if settings["presence_enabled"]:
+                await set_account_presence(is_presence_daytime(settings=settings))
+            else:
+                await set_account_presence(False)
+        except Exception as e:
+            logger.warning(f"[PRESENCE] Не удалось сразу применить переключатель: {e}")
+
+        await show_bot_menu(query)
+
+    elif data == "bot_presence_time":
+        user_edit_state[query.from_user.id] = {"mode": "presence_time"}
+        await query.message.reply_text(
+            "📝 Введите время, когда аккаунт должен быть online.\n\n"
+            "Формат: `08:00 23:30`\n"
+            "Первое время — включать online, второе — уходить offline.",
+            parse_mode="Markdown"
+        )
+
     elif data.startswith("manage_"):
         db = TopicManager.load_db()
         await show_manage_menu(query, data.split("_", 1)[1], db)
@@ -1042,10 +1148,33 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = user_edit_state.pop(user_id)
     new_input = update.message.text.strip()
-    cid = state["cid"]
+    cid = state.get("cid")
     text = None
 
-    if state["mode"] == "target_chat":
+    if state["mode"] == "presence_time":
+        parsed = parse_presence_time_range(new_input)
+        if not parsed:
+            await update.message.reply_text(
+                "❌ Не понял время. Введите два значения в формате `08:00 23:30`.",
+                parse_mode="Markdown"
+            )
+            return
+
+        start, end = parsed
+        settings = load_bot_settings()
+        settings["presence_online_from"] = start
+        settings["presence_online_until"] = end
+        save_bot_settings(settings)
+
+        try:
+            if settings.get("presence_enabled", True):
+                await set_account_presence(is_presence_daytime(settings=settings))
+        except Exception as e:
+            logger.warning(f"[PRESENCE] Не удалось сразу применить новое расписание: {e}")
+
+        text = f"✅ Время online обновлено: `{start}` — `{end}` (Киев)"
+
+    elif state["mode"] == "target_chat":
         if new_input == "0":
             new_val = None
             text = "✅ Теперь используются настройки по умолчанию."
