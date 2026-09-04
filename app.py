@@ -148,6 +148,19 @@ def parse_presence_time_range(text: str) -> tuple[str, str] | None:
     end = f"{int(matches[1][0]):02d}:{int(matches[1][1]):02d}"
     return start, end
 
+def parse_extra_route_input(text: str) -> tuple[int, int] | None:
+    numbers = re.findall(r"-?\d+", text)
+    if len(numbers) < 2:
+        return None
+    try:
+        extra_chat_id = int(numbers[0])
+        target_topic_id = int(numbers[1])
+    except ValueError:
+        return None
+    if target_topic_id <= 0:
+        return None
+    return extra_chat_id, target_topic_id
+
 def is_presence_daytime(now_kyiv: datetime | None = None, settings: dict | None = None) -> bool:
     settings = settings or load_bot_settings()
     now_kyiv = now_kyiv or get_now_kyiv()
@@ -437,8 +450,10 @@ class DB:
 
 # ====== TOPIC MANAGER ======
 # Новое поле в JSON-конфиге чата: "extra_targets" — список доп. каналов.
-# Каждый элемент: {"chat_id": int, "topics": {"<source_tid>": <target_tid>}}
-# Топики для доп. каналов управляются независимо от основного.
+# Старый формат {"chat_id": int, "topics": {"<source_tid>": <target_tid>}}
+# продолжает означать "дублировать весь чат".
+# Новый selective-формат {"chat_id": int, "mode": "selected", "topics": {...}}
+# дублирует только явно заданные source-ветки.
 #
 # ВАЖНО про блокировку: все операции "прочитать JSON -> изменить -> сохранить"
 # либо обёрнуты в data_lock (в методах ниже), либо в местах вызова
@@ -543,6 +558,10 @@ class TopicManager:
         return db.get(str(chat_id), {}).get("extra_targets", [])
 
     @staticmethod
+    def is_selected_extra_target(extra_target: dict) -> bool:
+        return extra_target.get("mode") == "selected"
+
+    @staticmethod
     async def add_extra_target(chat_id: str, extra_chat_id: int) -> bool:
         """Добавляет доп. канал к источнику. Возвращает False если уже есть."""
         async with data_lock:
@@ -563,6 +582,34 @@ class TopicManager:
             return True
 
     @staticmethod
+    async def add_extra_topic_route(chat_id: str, source_tid: str, extra_chat_id: int, target_tid: int) -> bool:
+        """Добавляет дубль конкретной source-ветки в конкретный топик доп. канала."""
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key = str(chat_id)
+            t_key = str(source_tid or 0)
+            if c_key not in db:
+                return False
+            if "extra_targets" not in db[c_key]:
+                db[c_key]["extra_targets"] = []
+
+            for et in db[c_key]["extra_targets"]:
+                if et.get("chat_id") == extra_chat_id:
+                    if "topics" not in et:
+                        et["topics"] = {}
+                    et["topics"][t_key] = target_tid
+                    TopicManager.save_db(db)
+                    return True
+
+            db[c_key]["extra_targets"].append({
+                "chat_id": extra_chat_id,
+                "mode": "selected",
+                "topics": {t_key: target_tid}
+            })
+            TopicManager.save_db(db)
+            return True
+
+    @staticmethod
     async def remove_extra_target(chat_id: str, extra_chat_id: int):
         """Удаляет доп. канал из источника."""
         async with data_lock:
@@ -575,6 +622,30 @@ class TopicManager:
                 if et["chat_id"] != extra_chat_id
             ]
             TopicManager.save_db(db)
+
+    @staticmethod
+    async def remove_extra_topic_route(chat_id: str, source_tid: str, extra_chat_id: int):
+        """Удаляет дубль конкретной source-ветки в доп. канал."""
+        async with data_lock:
+            db = TopicManager.load_db()
+            c_key = str(chat_id)
+            t_key = str(source_tid or 0)
+            if c_key not in db:
+                return
+
+            kept_targets = []
+            changed = False
+            for et in db[c_key].get("extra_targets", []):
+                if et.get("chat_id") == extra_chat_id and t_key in et.get("topics", {}):
+                    del et["topics"][t_key]
+                    changed = True
+                    if TopicManager.is_selected_extra_target(et) and not et.get("topics"):
+                        continue
+                kept_targets.append(et)
+
+            if changed:
+                db[c_key]["extra_targets"] = kept_targets
+                TopicManager.save_db(db)
 
     @staticmethod
     async def set_extra_topic(chat_id: str, extra_chat_id: int, s_tid: str, t_tid: int):
@@ -595,6 +666,21 @@ class TopicManager:
             if et["chat_id"] == extra_chat_id:
                 return et["topics"].get(str(s_tid))
         return None
+
+    @staticmethod
+    def get_extra_topic_routes(chat_id: str, s_tid) -> list:
+        """Возвращает доп. маршруты, явно настроенные для source-ветки."""
+        routes = []
+        t_key = str(s_tid or 0)
+        for et in TopicManager.get_extra_targets(chat_id):
+            topics = et.get("topics", {})
+            if t_key in topics:
+                routes.append({
+                    "chat_id": et["chat_id"],
+                    "topic_id": topics[t_key],
+                    "selected": TopicManager.is_selected_extra_target(et)
+                })
+        return routes
 
 # ====== FORUM MANAGER ======
 class ForumManager:
@@ -842,8 +928,8 @@ async def show_manage_menu(query, cid, db):
         for tid, tdata in cdata.get('topics', {}).items():
             t_enabled = tdata.get('enabled', True)
             t_status = "🟢" if t_enabled else "🔴"
-            t_title = escape_md(tdata.get('title', 'Без названия'))
             target_id = tdata.get('topic_id', '???')
+            extra_routes = TopicManager.get_extra_topic_routes(str(cid), tid)
 
             btn_display = f"{t_status} {tdata.get('title', 'Без названия')} ({tid}) ➡️ {target_id}"
             keyboard.append([InlineKeyboardButton(btn_display, callback_data=f"editid_{cid}_{tid}")])
@@ -854,6 +940,23 @@ async def show_manage_menu(query, cid, db):
                 ),
                 InlineKeyboardButton("❌ УДАЛИТЬ", callback_data=f"del_{cid}_{tid}")
             ])
+            keyboard.append([
+                InlineKeyboardButton("➕ ДУБЛЬ ВЕТКИ", callback_data=f"addroute_{cid}_{tid}")
+            ])
+            for route in extra_routes:
+                mode_label = "точечно" if route["selected"] else "весь чат"
+                route_buttons = [
+                    InlineKeyboardButton(
+                        f"↪ {route['chat_id']} / {route['topic_id']} ({mode_label})",
+                        callback_data="none"
+                    )
+                ]
+                if route["selected"]:
+                    route_buttons.append(InlineKeyboardButton(
+                        "🗑",
+                        callback_data=f"delroute_{cid}_{tid}_{route['chat_id']}"
+                    ))
+                keyboard.append(route_buttons)
 
     back_target = "list_privates" if is_private else "list_groups"
     keyboard.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_target)])
@@ -1101,12 +1204,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📝 Введите **ID дополнительного канала**, в который нужно дублировать сообщения:"
         )
 
+    elif data.startswith("addroute_"):
+        _, cid, tid = data.split("_", 2)
+        user_edit_state[query.from_user.id] = {"mode": "add_extra_route", "cid": cid, "tid": tid}
+        await query.message.reply_text(
+            "📝 Введите **ID дополнительного канала** и **ID топика** через пробел.\n\n"
+            "Пример:\n"
+            "`-1001234567890 777`\n\n"
+            f"Эта настройка будет дублировать только source-ветку `{tid}`.",
+            parse_mode="Markdown"
+        )
+
     elif data.startswith("delextra_"):
         # delextra_<cid>_<extra_chat_id>
         parts = data.split("_", 2)
         cid = parts[1]
         extra_chat_id = int(parts[2])
         await TopicManager.remove_extra_target(cid, extra_chat_id)
+        db = TopicManager.load_db()
+        await show_manage_menu(query, cid, db)
+
+    elif data.startswith("delroute_"):
+        _, cid, rest = data.split("_", 2)
+        tid, extra_chat_id = rest.rsplit("_", 1)
+        await TopicManager.remove_extra_topic_route(cid, tid, int(extra_chat_id))
         db = TopicManager.load_db()
         await show_manage_menu(query, cid, db)
 
@@ -1205,6 +1326,28 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             text = f"⚠️ Канал `{extra_chat_id}` уже добавлен или источник не найден."
+
+    elif state["mode"] == "add_extra_route":
+        tid = state["tid"]
+        parsed = parse_extra_route_input(new_input)
+        if not parsed:
+            await update.message.reply_text(
+                "❌ Не понял маршрут. Введите ID канала и ID топика через пробел.\n\n"
+                "Пример: `-1001234567890 777`",
+                parse_mode="Markdown"
+            )
+            return
+
+        extra_chat_id, target_topic_id = parsed
+        added = await TopicManager.add_extra_topic_route(cid, tid, extra_chat_id, target_topic_id)
+        if added:
+            text = (
+                "✅ Дубль ветки добавлен.\n"
+                f"Source topic `{tid}` будет дублироваться в канал `{extra_chat_id}`, "
+                f"топик `{target_topic_id}`."
+            )
+        else:
+            text = "⚠️ Не удалось добавить дубль: источник не найден."
 
     elif state["mode"] == "topic_id":
         tid = state["tid"]
@@ -1484,6 +1627,11 @@ async def telethon_handler(event):
 
     for et in extra_targets:
         extra_chat_id = et["chat_id"]
+        extra_topics = et.get("topics", {})
+        extra_target_tid = extra_topics.get(str(source_top_id))
+
+        if TopicManager.is_selected_extra_target(et) and extra_target_tid is None:
+            continue
 
         # Получаем reply_to для доп. канала из таблицы msg_map_extra
         extra_reply_id = None
@@ -1495,7 +1643,6 @@ async def telethon_handler(event):
                     break
 
         # Целевой топик для этого доп. канала
-        extra_target_tid = TopicManager.get_extra_topic(chat_id_str, extra_chat_id, source_top_id)
         if extra_target_tid is not None and int(extra_target_tid) <= 1:
             extra_target_tid = None
 
