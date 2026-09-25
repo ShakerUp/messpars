@@ -148,18 +148,28 @@ def parse_presence_time_range(text: str) -> tuple[str, str] | None:
     end = f"{int(matches[1][0]):02d}:{int(matches[1][1]):02d}"
     return start, end
 
-def parse_extra_route_input(text: str) -> tuple[int, int] | None:
-    numbers = re.findall(r"-?\d+", text)
-    if len(numbers) < 2:
+def parse_extra_route_input(text: str) -> tuple[int, int, list[str]] | None:
+    match = re.match(r"^\s*(-?\d+)\s+(\d+)(?:\s+([\s\S]*))?$", text)
+    if not match:
         return None
     try:
-        extra_chat_id = int(numbers[0])
-        target_topic_id = int(numbers[1])
+        extra_chat_id = int(match.group(1))
+        target_topic_id = int(match.group(2))
     except ValueError:
         return None
     if target_topic_id <= 0:
         return None
-    return extra_chat_id, target_topic_id
+
+    keywords = []
+    seen = set()
+    for value in re.split(r"[\n,;]+", match.group(3) or ""):
+        keyword = value.strip()
+        normalized = keyword.casefold()
+        if keyword and normalized not in seen:
+            seen.add(normalized)
+            keywords.append(keyword)
+
+    return extra_chat_id, target_topic_id, keywords
 
 def is_presence_daytime(now_kyiv: datetime | None = None, settings: dict | None = None) -> bool:
     settings = settings or load_bot_settings()
@@ -598,7 +608,13 @@ class TopicManager:
             return True
 
     @staticmethod
-    async def add_extra_topic_route(chat_id: str, source_tid: str, extra_chat_id: int, target_tid: int) -> bool:
+    async def add_extra_topic_route(
+        chat_id: str,
+        source_tid: str,
+        extra_chat_id: int,
+        target_tid: int,
+        keywords: list[str] | None = None
+    ) -> bool:
         """Добавляет дубль конкретной source-ветки в конкретный топик доп. канала."""
         async with data_lock:
             db = TopicManager.load_db()
@@ -614,14 +630,24 @@ class TopicManager:
                     if "topics" not in et:
                         et["topics"] = {}
                     et["topics"][t_key] = target_tid
+                    filters = et.setdefault("keyword_filters", {})
+                    if keywords:
+                        filters[t_key] = keywords
+                    else:
+                        filters.pop(t_key, None)
+                    if not filters:
+                        et.pop("keyword_filters", None)
                     TopicManager.save_db(db)
                     return True
 
-            db[c_key]["extra_targets"].append({
+            new_target = {
                 "chat_id": extra_chat_id,
                 "mode": "selected",
                 "topics": {t_key: target_tid}
-            })
+            }
+            if keywords:
+                new_target["keyword_filters"] = {t_key: keywords}
+            db[c_key]["extra_targets"].append(new_target)
             TopicManager.save_db(db)
             return True
 
@@ -654,6 +680,10 @@ class TopicManager:
             for et in db[c_key].get("extra_targets", []):
                 if et.get("chat_id") == extra_chat_id and t_key in et.get("topics", {}):
                     del et["topics"][t_key]
+                    filters = et.get("keyword_filters", {})
+                    filters.pop(t_key, None)
+                    if not filters:
+                        et.pop("keyword_filters", None)
                     changed = True
                     if TopicManager.is_selected_extra_target(et) and not et.get("topics"):
                         continue
@@ -694,9 +724,14 @@ class TopicManager:
                 routes.append({
                     "chat_id": et["chat_id"],
                     "topic_id": topics[t_key],
-                    "selected": TopicManager.is_selected_extra_target(et)
+                    "selected": TopicManager.is_selected_extra_target(et),
+                    "keywords": et.get("keyword_filters", {}).get(t_key, [])
                 })
         return routes
+
+    @staticmethod
+    def get_extra_topic_keywords(extra_target: dict, s_tid) -> list[str]:
+        return extra_target.get("keyword_filters", {}).get(str(s_tid or 0), [])
 
 # ====== FORUM MANAGER ======
 class ForumManager:
@@ -740,8 +775,13 @@ async def get_source_topic_title(chat, source_top_id, chat_conf=None, msg=None) 
         return title
 
     try:
-        from telethon.tl.functions.channels import GetForumTopicsByIDRequest
-        res = await client(GetForumTopicsByIDRequest(channel=chat, topics=[int(source_top_id)]))
+        try:
+            from telethon.tl.functions.messages import GetForumTopicsByIDRequest
+            request = GetForumTopicsByIDRequest(peer=chat, topics=[int(source_top_id)])
+        except ImportError:
+            from telethon.tl.functions.channels import GetForumTopicsByIDRequest
+            request = GetForumTopicsByIDRequest(channel=chat, topics=[int(source_top_id)])
+        res = await client(request)
         if res and getattr(res, "topics", None):
             title = getattr(res.topics[0], "title", None)
             if title:
@@ -773,12 +813,68 @@ def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
     if getattr(reply_to, 'reply_to_msg_id', None):
         candidate = int(reply_to.reply_to_msg_id)
         known_topics = (chat_conf or {}).get('topics', {})
-        if str(candidate) in known_topics:
+        is_forum = isinstance(chat, Channel) and getattr(chat, 'forum', False)
+        forum_topic = getattr(reply_to, 'forum_topic', None)
+        # В forum-чате только forum_topic=True подтверждает, что candidate — корень ветки.
+        if str(candidate) in known_topics and (not is_forum or forum_topic is True):
             return candidate
-        if isinstance(chat, Channel) and getattr(chat, 'forum', False):
+        if is_forum and forum_topic is True:
             return candidate
 
     return 0
+
+def get_real_reply_source_msg_id(msg, source_top_id: int) -> int | None:
+    """
+    В forum-топиках Telegram reply_to_msg_id часто указывает на корневое
+    сообщение ветки даже для обычных сообщений. Такой служебный reply нельзя
+    переносить в target, иначе вся ветка начинает отвечать на один старый msg.
+    """
+    reply_to = getattr(msg, "reply_to", None)
+    if not reply_to:
+        return None
+
+    reply_to_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+    if not reply_to_msg_id:
+        return None
+
+    reply_to_msg_id = int(reply_to_msg_id)
+    reply_to_top_id = getattr(reply_to, "reply_to_top_id", None)
+    if reply_to_top_id is not None and reply_to_msg_id == int(reply_to_top_id):
+        return None
+    if source_top_id and reply_to_msg_id == int(source_top_id):
+        return None
+
+    return reply_to_msg_id
+
+def same_optional_int(left, right) -> bool:
+    if left is None or right is None:
+        return left is right
+    try:
+        return int(left) == int(right)
+    except (TypeError, ValueError):
+        return left == right
+
+def message_matches_keywords(msg, keywords: list[str]) -> bool:
+    if not keywords:
+        return True
+
+    searchable_parts = [getattr(msg, "message", "") or ""]
+    for entity in getattr(msg, "entities", None) or []:
+        url = getattr(entity, "url", None)
+        if url:
+            searchable_parts.append(str(url))
+
+    webpage = getattr(getattr(msg, "media", None), "webpage", None)
+    webpage_url = getattr(webpage, "url", None)
+    if webpage_url:
+        searchable_parts.append(str(webpage_url))
+
+    haystack = "\n".join(searchable_parts).casefold()
+    return any(
+        str(keyword).casefold() in haystack
+        for keyword in keywords
+        if str(keyword).strip()
+    )
 
 # ====== BACKUP / RESTORE ======
 
@@ -1004,13 +1100,19 @@ async def show_manage_menu(query, cid, db):
                 InlineKeyboardButton("❌ УДАЛИТЬ", callback_data=f"del_{cid}_{tid}")
             ])
             keyboard.append([
-                InlineKeyboardButton("➕ ДУБЛЬ ВЕТКИ", callback_data=f"addroute_{cid}_{tid}")
+                InlineKeyboardButton("➕ ДУБЛЬ / ФИЛЬТР", callback_data=f"addroute_{cid}_{tid}")
             ])
             for route in extra_routes:
                 mode_label = "точечно" if route["selected"] else "весь чат"
+                keywords = route.get("keywords", [])
+                keyword_label = ""
+                if keywords:
+                    keyword_label = f" | 🔎 {keywords[0][:28]}"
+                    if len(keywords) > 1:
+                        keyword_label += f" +{len(keywords) - 1}"
                 route_buttons = [
                     InlineKeyboardButton(
-                        f"↪ {route['chat_id']} / {route['topic_id']} ({mode_label})",
+                        f"↪ {route['chat_id']} / {route['topic_id']} ({mode_label}){keyword_label}",
                         callback_data="none"
                     )
                 ]
@@ -1271,10 +1373,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, cid, tid = data.split("_", 2)
         user_edit_state[query.from_user.id] = {"mode": "add_extra_route", "cid": cid, "tid": tid}
         await query.message.reply_text(
-            "📝 Введите **ID дополнительного канала** и **ID топика** через пробел.\n\n"
-            "Пример:\n"
+            "📝 Введите **ID дополнительного канала**, **ID топика**, а затем при необходимости "
+            "ключевые слова. Несколько ключей разделяйте запятыми или переносами строк.\n\n"
+            "Вся ветка:\n"
             "`-1001234567890 777`\n\n"
-            f"Эта настройка будет дублировать только source-ветку `{tid}`.",
+            "Только сообщения со ссылкой Fundoor:\n"
+            "`-1001234567890 777 fundoor.pro/spreadchart`\n\n"
+            f"Фильтр применяется только к source-ветке `{tid}`. Достаточно совпадения одного ключа.",
             parse_mode="Markdown"
         )
 
@@ -1401,13 +1506,21 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        extra_chat_id, target_topic_id = parsed
-        added = await TopicManager.add_extra_topic_route(cid, tid, extra_chat_id, target_topic_id)
+        extra_chat_id, target_topic_id, keywords = parsed
+        added = await TopicManager.add_extra_topic_route(
+            cid, tid, extra_chat_id, target_topic_id, keywords=keywords
+        )
         if added:
+            filter_text = (
+                "\nФильтр: " + ", ".join(f"`{keyword}`" for keyword in keywords)
+                if keywords else
+                "\nФильтр: нет, пересылаются все сообщения ветки."
+            )
             text = (
                 "✅ Дубль ветки добавлен.\n"
                 f"Source topic `{tid}` будет дублироваться в канал `{extra_chat_id}`, "
                 f"топик `{target_topic_id}`."
+                f"{filter_text}"
             )
         else:
             text = "⚠️ Не удалось добавить дубль: источник не найден."
@@ -1537,7 +1650,7 @@ async def send_to_target(
 
         except Exception as e:
             err_str = str(e)
-            if "Message thread not found" in err_str or "thread" in err_str.lower():
+            if "message thread not found" in err_str.lower():
                 logger.warning(
                     f"[RE-CREATE {'EXTRA' if is_extra else 'MAIN'}] "
                     f"Ветка {current_target_tid} невалидна. Пересоздаю..."
@@ -1598,27 +1711,42 @@ async def telethon_handler(event):
     # ===== Source topic =====
     source_top_id = resolve_source_topic_id(msg, chat, chat_conf)
 
+    # ===== Target topic (основной канал) =====
+    target_tid = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('topic_id')
+    if target_tid is not None and int(target_tid) <= 1:
+        target_tid = None
+
     # ===== Reply mapping =====
     reply_to_target_id = None
     reply_mapping = None
-    if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id'):
-        reply_mapping = DB.get(msg.reply_to.reply_to_msg_id)
-        if reply_mapping:
-            reply_to_target_id = reply_mapping['tgt_id']
-
-    # ===== Target topic (основной канал) =====
-    target_tid = chat_conf.get('topics', {}).get(str(source_top_id), {}).get('topic_id')
-    if not target_tid and reply_mapping:
-        target_tid = reply_mapping.get('tid')
-    if target_tid is not None and int(target_tid) <= 1:
-        target_tid = None
+    real_reply_source_msg_id = get_real_reply_source_msg_id(msg, source_top_id)
+    if real_reply_source_msg_id is not None:
+        reply_mapping = DB.get(real_reply_source_msg_id)
+        if reply_mapping and same_optional_int(reply_mapping.get("tgt_chat_id"), final_target_chat):
+            if not target_tid:
+                target_tid = reply_mapping.get('tid')
+            if same_optional_int(reply_mapping.get("tid"), target_tid):
+                reply_to_target_id = reply_mapping['tgt_id']
+            else:
+                logger.info(
+                    f"[REPLY SKIP] reply mapping topic mismatch: "
+                    f"src_reply={real_reply_source_msg_id}, mapped_tid={reply_mapping.get('tid')}, "
+                    f"current_tid={target_tid}"
+                )
+        elif reply_mapping:
+            logger.info(
+                f"[REPLY SKIP] reply mapping chat mismatch: "
+                f"src_reply={real_reply_source_msg_id}, mapped_chat={reply_mapping.get('tgt_chat_id')}, "
+                f"current_chat={final_target_chat}"
+            )
 
     logger.info(
         f"[THREAD CHECK] chat.id={chat.id}, msg.id={msg.id}, "
         f"source_top_id={source_top_id}, "
         f"message_thread_id={getattr(msg, 'message_thread_id', None)}, "
         f"reply_to_top_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_top_id', None)}, "
-        f"reply_to_msg_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_msg_id', None)}"
+        f"reply_to_msg_id={getattr(getattr(msg, 'reply_to', None), 'reply_to_msg_id', None)}, "
+        f"forum_topic={getattr(getattr(msg, 'reply_to', None), 'forum_topic', None)}"
     )
 
     status = TopicManager.get_status(chat.id, source_top_id)
@@ -1648,7 +1776,7 @@ async def telethon_handler(event):
         await TopicManager.register_source(chat.id, chat_title, "private", 0)
         return
 
-    if not target_tid and msg.reply_to and source_top_id == 0:
+    if not target_tid and real_reply_source_msg_id is not None and source_top_id == 0:
         logger.info(
             f"[SKIP REPLY AUTO CREATE] chat={chat.id}, msg={msg.id} "
             f"— reply без явного source topic, новый топик не создаем"
@@ -1692,16 +1820,27 @@ async def telethon_handler(event):
         extra_chat_id = et["chat_id"]
         extra_topics = et.get("topics", {})
         extra_target_tid = extra_topics.get(str(source_top_id))
+        route_keywords = TopicManager.get_extra_topic_keywords(et, source_top_id)
 
         if TopicManager.is_selected_extra_target(et) and extra_target_tid is None:
             continue
 
+        if route_keywords and not message_matches_keywords(msg, route_keywords):
+            logger.info(
+                f"[FILTER SKIP EXTRA] Msg {msg.id} (Source Topic:{source_top_id}) "
+                f"не содержит ключи {route_keywords} для канала {extra_chat_id}"
+            )
+            continue
+
         # Получаем reply_to для доп. канала из таблицы msg_map_extra
         extra_reply_id = None
-        if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id'):
-            extra_mappings = DB.get_extra(msg.reply_to.reply_to_msg_id)
+        if real_reply_source_msg_id is not None:
+            extra_mappings = DB.get_extra(real_reply_source_msg_id)
             for em in extra_mappings:
-                if em["tgt_chat_id"] == extra_chat_id:
+                if (
+                    same_optional_int(em["tgt_chat_id"], extra_chat_id)
+                    and same_optional_int(em.get("tid"), extra_target_tid)
+                ):
                     extra_reply_id = em["tgt_id"]
                     break
 
