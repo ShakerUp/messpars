@@ -8,8 +8,10 @@ import sqlite3
 import logging
 import zipfile
 import random
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone, timedelta, time as dt_time
-from html import escape
+from html import escape, unescape
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
@@ -51,6 +53,7 @@ ADMIN_ID = 684460638
 
 TOPICS_DB_FILE = 'topics_mapping.json'
 BOT_SETTINGS_FILE = 'bot_settings.json'
+BINANCE_ANNOUNCEMENTS_STATE_FILE = 'binance_announcements_state.json'
 DB_FILE = 'bot_data.db'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
@@ -71,10 +74,29 @@ PRESENCE_REFRESH_SECONDS = int(os.getenv("PRESENCE_REFRESH_SECONDS", "75"))
 PRESENCE_NIGHT_CHECK_SECONDS = int(os.getenv("PRESENCE_NIGHT_CHECK_SECONDS", "600"))
 PRESENCE_JITTER_SECONDS = int(os.getenv("PRESENCE_JITTER_SECONDS", "15"))
 
+# ====== BINANCE ANNOUNCEMENTS CONFIG ======
+BINANCE_ANNOUNCEMENTS_POLL_SECONDS = max(
+    15, int(os.getenv("BINANCE_ANNOUNCEMENTS_POLL_SECONDS", "30"))
+)
+BINANCE_ANNOUNCEMENTS_PAGE_SIZE = max(
+    20, min(100, int(os.getenv("BINANCE_ANNOUNCEMENTS_PAGE_SIZE", "50")))
+)
+BINANCE_ANNOUNCEMENTS_LIST_URLS = (
+    "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query",
+    "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query",
+)
+BINANCE_ANNOUNCEMENTS_DETAIL_URL = (
+    "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
+)
+
 DEFAULT_BOT_SETTINGS = {
     "presence_enabled": PRESENCE_ENABLED,
     "presence_online_from": PRESENCE_ONLINE_FROM_KYIV,
     "presence_online_until": PRESENCE_ONLINE_UNTIL_KYIV,
+    "binance_announcements_enabled": False,
+    "binance_announcements_keywords": [],
+    "binance_announcements_target_chat_id": None,
+    "binance_announcements_target_topic_id": None,
 }
 
 # ====== БЛОКИРОВКА ДЛЯ ЗАПИСИ В КОНФИГ/БД ПРИ RESTORE ======
@@ -121,6 +143,22 @@ def load_bot_settings() -> dict:
     settings["presence_enabled"] = bool(settings.get("presence_enabled"))
     settings["presence_online_from"] = str(settings.get("presence_online_from") or "08:00")
     settings["presence_online_until"] = str(settings.get("presence_online_until") or "23:30")
+    settings["binance_announcements_enabled"] = bool(
+        settings.get("binance_announcements_enabled")
+    )
+    raw_keywords = settings.get("binance_announcements_keywords", [])
+    settings["binance_announcements_keywords"] = (
+        [str(value).strip() for value in raw_keywords if str(value).strip()]
+        if isinstance(raw_keywords, list) else []
+    )
+    for key in (
+        "binance_announcements_target_chat_id",
+        "binance_announcements_target_topic_id",
+    ):
+        try:
+            settings[key] = int(settings[key]) if settings.get(key) is not None else None
+        except (TypeError, ValueError):
+            settings[key] = None
     return settings
 
 def save_bot_settings(settings: dict):
@@ -148,6 +186,26 @@ def parse_presence_time_range(text: str) -> tuple[str, str] | None:
     end = f"{int(matches[1][0]):02d}:{int(matches[1][1]):02d}"
     return start, end
 
+def parse_keyword_list(text: str) -> list[str]:
+    keywords = []
+    seen = set()
+    for value in re.split(r"[\n,;]+", text or ""):
+        keyword = value.strip()
+        normalized = keyword.casefold()
+        if keyword and normalized not in seen:
+            seen.add(normalized)
+            keywords.append(keyword)
+    return keywords
+
+def parse_chat_topic_target(text: str) -> tuple[int, int] | None:
+    match = re.match(r"^\s*(-?\d+)\s+(\d+)\s*$", text or "")
+    if not match:
+        return None
+    chat_id, topic_id = int(match.group(1)), int(match.group(2))
+    if topic_id <= 0:
+        return None
+    return chat_id, topic_id
+
 def parse_extra_route_input(text: str) -> tuple[int, int, list[str]] | None:
     match = re.match(r"^\s*(-?\d+)\s+(\d+)(?:\s+([\s\S]*))?$", text)
     if not match:
@@ -160,14 +218,7 @@ def parse_extra_route_input(text: str) -> tuple[int, int, list[str]] | None:
     if target_topic_id <= 0:
         return None
 
-    keywords = []
-    seen = set()
-    for value in re.split(r"[\n,;]+", match.group(3) or ""):
-        keyword = value.strip()
-        normalized = keyword.casefold()
-        if keyword and normalized not in seen:
-            seen.add(normalized)
-            keywords.append(keyword)
+    keywords = parse_keyword_list(match.group(3) or "")
 
     return extra_chat_id, target_topic_id, keywords
 
@@ -232,6 +283,324 @@ async def presence_emulation_loop():
         except Exception as e:
             logger.error(f"[PRESENCE ERROR] {e}")
             await asyncio.sleep(300)
+
+# ====== BINANCE ANNOUNCEMENTS ======
+
+def load_binance_announcements_state() -> dict:
+    state = {"initialized": False, "reseed_required": False, "seen_codes": []}
+    if not os.path.exists(BINANCE_ANNOUNCEMENTS_STATE_FILE):
+        return state
+    try:
+        with open(BINANCE_ANNOUNCEMENTS_STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            state.update(saved)
+    except Exception as e:
+        logger.warning(f"[BINANCE] Не удалось прочитать state: {e}")
+
+    seen_codes = state.get("seen_codes", [])
+    state["seen_codes"] = (
+        [str(code) for code in seen_codes if code][:1000]
+        if isinstance(seen_codes, list) else []
+    )
+    state["initialized"] = bool(state.get("initialized"))
+    state["reseed_required"] = bool(state.get("reseed_required"))
+    return state
+
+def save_binance_announcements_state(state: dict):
+    tmp_path = f"{BINANCE_ANNOUNCEMENTS_STATE_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, BINANCE_ANNOUNCEMENTS_STATE_FILE)
+
+def request_binance_announcements_reseed():
+    state = load_binance_announcements_state()
+    state["reseed_required"] = True
+    save_binance_announcements_state(state)
+
+def _binance_http_json_sync(url: str, params: dict) -> dict:
+    full_url = f"{url}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(
+        full_url,
+        headers={
+            "Accept": "application/json",
+            "Accept-Language": "en",
+            "lang": "en",
+            "clienttype": "web",
+            "User-Agent": "Mozilla/5.0 (compatible; TelegramMirrorBot/1.0)",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+async def binance_http_json(url: str, params: dict) -> dict:
+    return await asyncio.to_thread(_binance_http_json_sync, url, params)
+
+def parse_binance_announcement_list(payload: dict) -> list[dict]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return []
+
+    raw_items = []
+    direct_articles = data.get("articles")
+    if isinstance(direct_articles, list):
+        raw_items.extend((article, data.get("catalogName", "")) for article in direct_articles)
+
+    for catalog in data.get("catalogs", []) or []:
+        if not isinstance(catalog, dict):
+            continue
+        category = str(catalog.get("catalogName") or "")
+        for article in catalog.get("articles", []) or []:
+            raw_items.append((article, category))
+
+    result = {}
+    for article, category in raw_items:
+        if not isinstance(article, dict):
+            continue
+        code = str(article.get("code") or article.get("id") or "").strip()
+        title = str(article.get("title") or "").strip()
+        if not code or not title:
+            continue
+        try:
+            release_date = int(article.get("releaseDate") or article.get("publishDate") or 0)
+        except (TypeError, ValueError):
+            release_date = 0
+        result[code] = {
+            "code": code,
+            "title": title,
+            "category": category,
+            "release_date": release_date,
+        }
+
+    return sorted(result.values(), key=lambda item: item["release_date"], reverse=True)
+
+async def fetch_binance_announcements(page_size: int = BINANCE_ANNOUNCEMENTS_PAGE_SIZE) -> list[dict]:
+    errors = []
+    params = {"type": 1, "pageNo": 1, "pageSize": page_size}
+    for url in BINANCE_ANNOUNCEMENTS_LIST_URLS:
+        try:
+            payload = await binance_http_json(url, params)
+            articles = parse_binance_announcement_list(payload)
+            if articles:
+                return articles
+            errors.append(f"{url}: пустой ответ")
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+    raise RuntimeError("; ".join(errors))
+
+def _collect_binance_body_text(node, parts: list[str]):
+    if isinstance(node, dict):
+        if node.get("node") == "text" and node.get("text"):
+            parts.append(str(node["text"]))
+        for key in ("child", "children", "content"):
+            if key in node:
+                _collect_binance_body_text(node[key], parts)
+    elif isinstance(node, list):
+        for child in node:
+            _collect_binance_body_text(child, parts)
+
+def binance_body_to_text(body) -> str:
+    if not body:
+        return ""
+    if isinstance(body, (dict, list)):
+        parsed = body
+    else:
+        raw = str(body)
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", raw))).strip()
+
+    parts = []
+    _collect_binance_body_text(parsed, parts)
+    return re.sub(r"\s+", " ", unescape(" ".join(parts))).strip()
+
+async def fetch_binance_announcement_body(code: str) -> str:
+    payload = await binance_http_json(BINANCE_ANNOUNCEMENTS_DETAIL_URL, {"articleCode": code})
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    return binance_body_to_text(data.get("body"))
+
+async def search_binance_announcements(
+    articles: list[dict],
+    keywords: list[str],
+    limit: int = 10,
+) -> list[dict]:
+    semaphore = asyncio.Semaphore(6)
+
+    async def inspect_article(article: dict) -> dict | None:
+        if binance_announcement_matches(article, keywords):
+            return article
+        try:
+            async with semaphore:
+                body_text = await fetch_binance_announcement_body(article["code"])
+        except Exception as e:
+            logger.warning(f"[BINANCE SEARCH DETAIL] {article['code']}: {e}")
+            return None
+        return article if binance_announcement_matches(article, keywords, body_text) else None
+
+    inspected = await asyncio.gather(*(inspect_article(article) for article in articles))
+    return [article for article in inspected if article is not None][:limit]
+
+def binance_announcement_url(code: str) -> str:
+    return f"https://www.binance.com/en/support/announcement/detail/{code}"
+
+def binance_announcement_matches(
+    article: dict,
+    keywords: list[str],
+    body_text: str = ""
+) -> list[str]:
+    haystack = "\n".join((
+        str(article.get("title") or ""),
+        str(article.get("category") or ""),
+        body_text,
+    )).casefold()
+    return [keyword for keyword in keywords if keyword.casefold() in haystack]
+
+def format_binance_announcement_date(timestamp_ms: int) -> str:
+    if not timestamp_ms:
+        return "дата неизвестна"
+    dt = datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc) + timedelta(hours=KYIV_OFFSET)
+    return dt.strftime("%d.%m.%Y %H:%M") + " (Киев)"
+
+def build_binance_match_excerpt(body_text: str, keywords: list[str], limit: int = 500) -> str:
+    clean_text = re.sub(r"\s+", " ", body_text or "").strip()
+    if not clean_text:
+        return ""
+    lowered = clean_text.casefold()
+    positions = [lowered.find(keyword.casefold()) for keyword in keywords]
+    positions = [position for position in positions if position >= 0]
+    if not positions:
+        return ""
+    start = max(0, min(positions) - 160)
+    end = min(len(clean_text), start + limit)
+    excerpt = clean_text[start:end].strip()
+    if start:
+        excerpt = "..." + excerpt
+    if end < len(clean_text):
+        excerpt += "..."
+    return excerpt
+
+async def send_binance_announcement_notification(
+    article: dict,
+    body_text: str,
+    matched_keywords: list[str],
+    settings: dict,
+):
+    target_chat_id = settings["binance_announcements_target_chat_id"]
+    target_topic_id = settings["binance_announcements_target_topic_id"]
+    title = escape(article["title"])
+    category = escape(article.get("category") or "Без категории")
+    url = escape(binance_announcement_url(article["code"]), quote=True)
+    matched = ", ".join(f"<code>{escape(keyword)}</code>" for keyword in matched_keywords)
+    excerpt = build_binance_match_excerpt(body_text, matched_keywords)
+
+    text = (
+        "🟨 <b>Binance Announcement</b>\n\n"
+        f"<b>{title}</b>\n"
+        f"Категория: {category}\n"
+        f"Дата: {format_binance_announcement_date(article['release_date'])}\n"
+        f"Совпадение: {matched}"
+    )
+    if excerpt:
+        text += f"\n\n{escape(excerpt)}"
+    text += f'\n\n<a href="{url}">Открыть анонс на Binance</a>'
+
+    await bot_app.bot.send_message(
+        chat_id=target_chat_id,
+        message_thread_id=target_topic_id,
+        text=text,
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+async def binance_announcements_loop():
+    failures = 0
+    logger.info("[BINANCE] Фоновый монитор анонсов запущен")
+
+    while True:
+        try:
+            settings = load_bot_settings()
+            if not settings.get("binance_announcements_enabled"):
+                failures = 0
+                await asyncio.sleep(30)
+                continue
+
+            keywords = settings.get("binance_announcements_keywords", [])
+            target_chat_id = settings.get("binance_announcements_target_chat_id")
+            target_topic_id = settings.get("binance_announcements_target_topic_id")
+            if not keywords or target_chat_id is None or target_topic_id is None:
+                logger.warning("[BINANCE] Монитор включен, но ключи или target не настроены")
+                await asyncio.sleep(60)
+                continue
+
+            articles = await fetch_binance_announcements()
+            failures = 0
+            state = load_binance_announcements_state()
+            current_codes = [article["code"] for article in articles]
+
+            if not state["initialized"] or state["reseed_required"]:
+                state.update({
+                    "initialized": True,
+                    "reseed_required": False,
+                    "seen_codes": current_codes[:1000],
+                })
+                save_binance_announcements_state(state)
+                logger.info(
+                    f"[BINANCE] Базовая лента сохранена ({len(current_codes)} анонсов), "
+                    "старые уведомления не отправляются"
+                )
+                await asyncio.sleep(BINANCE_ANNOUNCEMENTS_POLL_SECONDS)
+                continue
+
+            seen_codes = set(state["seen_codes"])
+            unseen_articles = [a for a in articles if a["code"] not in seen_codes]
+
+            for article in reversed(unseen_articles):
+                body_text = ""
+                handled = True
+                matched_keywords = binance_announcement_matches(article, keywords)
+                if not matched_keywords:
+                    try:
+                        body_text = await fetch_binance_announcement_body(article["code"])
+                        matched_keywords = binance_announcement_matches(
+                            article, keywords, body_text=body_text
+                        )
+                    except Exception as e:
+                        handled = False
+                        logger.warning(
+                            f"[BINANCE DETAIL] Не удалось загрузить {article['code']}: {e}"
+                        )
+
+                if matched_keywords:
+                    try:
+                        await send_binance_announcement_notification(
+                            article, body_text, matched_keywords, settings
+                        )
+                        logger.info(
+                            f"[BINANCE MATCH] {article['code']} keywords={matched_keywords}"
+                        )
+                    except Exception as e:
+                        handled = False
+                        logger.error(f"[BINANCE SEND ERROR] {article['code']}: {e}")
+
+                if handled:
+                    seen_codes.add(article["code"])
+
+            ordered_seen = [code for code in current_codes if code in seen_codes]
+            ordered_seen.extend(code for code in state["seen_codes"] if code not in ordered_seen)
+            state["seen_codes"] = ordered_seen[:1000]
+            save_binance_announcements_state(state)
+            await asyncio.sleep(BINANCE_ANNOUNCEMENTS_POLL_SECONDS)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            failures += 1
+            wait_for = min(300, BINANCE_ANNOUNCEMENTS_POLL_SECONDS * (2 ** min(failures, 4)))
+            logger.error(f"[BINANCE ERROR] {e}; повтор через {wait_for} сек")
+            await asyncio.sleep(wait_for)
 
 def render_message_html(msg) -> str:
     """
@@ -906,6 +1275,11 @@ async def create_backup_archive() -> str | None:
                     zf.write(TOPICS_DB_FILE, arcname=TOPICS_DB_FILE)
                 if os.path.exists(BOT_SETTINGS_FILE):
                     zf.write(BOT_SETTINGS_FILE, arcname=BOT_SETTINGS_FILE)
+                if os.path.exists(BINANCE_ANNOUNCEMENTS_STATE_FILE):
+                    zf.write(
+                        BINANCE_ANNOUNCEMENTS_STATE_FILE,
+                        arcname=BINANCE_ANNOUNCEMENTS_STATE_FILE,
+                    )
 
         return archive_path
     except Exception as e:
@@ -1001,6 +1375,8 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
                 zf.extract(TOPICS_DB_FILE, path='.')
                 if BOT_SETTINGS_FILE in names:
                     zf.extract(BOT_SETTINGS_FILE, path='.')
+                if BINANCE_ANNOUNCEMENTS_STATE_FILE in names:
+                    zf.extract(BINANCE_ANNOUNCEMENTS_STATE_FILE, path='.')
 
         DB.init()
         await update.message.reply_text(
@@ -1151,6 +1527,7 @@ async def show_bot_menu(query):
             callback_data="bot_presence_toggle"
         )],
         [InlineKeyboardButton("🕘 ИЗМЕНИТЬ ВРЕМЯ ONLINE", callback_data="bot_presence_time")],
+        [InlineKeyboardButton("🟨 BINANCE ANNOUNCEMENTS", callback_data="bot_binance_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
     ]
 
@@ -1158,6 +1535,42 @@ async def show_bot_menu(query):
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
+    )
+
+async def show_binance_announcements_menu(query):
+    settings = load_bot_settings()
+    enabled = settings.get("binance_announcements_enabled", False)
+    keywords = settings.get("binance_announcements_keywords", [])
+    target_chat_id = settings.get("binance_announcements_target_chat_id")
+    target_topic_id = settings.get("binance_announcements_target_topic_id")
+
+    keywords_text = ", ".join(escape(keyword) for keyword in keywords) if keywords else "не заданы"
+    target_text = (
+        f"<code>{target_chat_id}</code> / topic <code>{target_topic_id}</code>"
+        if target_chat_id is not None and target_topic_id is not None else
+        "не задан"
+    )
+    text = (
+        "🟨 <b>Binance Announcements</b>\n\n"
+        f"Монитор: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
+        f"Ключевые слова: {keywords_text}\n"
+        f"Куда отправлять: {target_text}\n"
+        f"Интервал проверки: {BINANCE_ANNOUNCEMENTS_POLL_SECONDS} сек.\n\n"
+        "Поиск вручную: <code>/announcements HYPE, delist</code>"
+    )
+    keyboard = [
+        [InlineKeyboardButton(
+            "⛔ ВЫКЛЮЧИТЬ МОНИТОР" if enabled else "✅ ВКЛЮЧИТЬ МОНИТОР",
+            callback_data="bot_binance_toggle",
+        )],
+        [InlineKeyboardButton("🔎 ИЗМЕНИТЬ КЛЮЧИ", callback_data="bot_binance_keywords")],
+        [InlineKeyboardButton("🎯 ИЗМЕНИТЬ ЧАТ / ТОПИК", callback_data="bot_binance_target")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="bot_settings")],
+    ]
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
     )
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1304,6 +1717,50 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "bot_settings":
         await show_bot_menu(query)
 
+    elif data == "bot_binance_settings":
+        await show_binance_announcements_menu(query)
+
+    elif data == "bot_binance_toggle":
+        settings = load_bot_settings()
+        currently_enabled = settings.get("binance_announcements_enabled", False)
+        if not currently_enabled:
+            missing = []
+            if not settings.get("binance_announcements_keywords"):
+                missing.append("ключевые слова")
+            if settings.get("binance_announcements_target_chat_id") is None:
+                missing.append("целевой чат")
+            if settings.get("binance_announcements_target_topic_id") is None:
+                missing.append("целевой топик")
+            if missing:
+                await query.message.reply_text(
+                    "❌ Сначала настройте: " + ", ".join(missing) + "."
+                )
+                await show_binance_announcements_menu(query)
+                return
+            request_binance_announcements_reseed()
+
+        settings["binance_announcements_enabled"] = not currently_enabled
+        save_bot_settings(settings)
+        await show_binance_announcements_menu(query)
+
+    elif data == "bot_binance_keywords":
+        user_edit_state[query.from_user.id] = {"mode": "binance_keywords"}
+        await query.message.reply_text(
+            "📝 Введите ключевые слова через запятую или каждое с новой строки.\n\n"
+            "Совпадение любого ключа отправит уведомление.\n"
+            "Пример: `HYPE, delist, perpetual contract`\n"
+            "Чтобы очистить список, отправьте `0`.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "bot_binance_target":
+        user_edit_state[query.from_user.id] = {"mode": "binance_target"}
+        await query.message.reply_text(
+            "📝 Введите ID чата и ID топика через пробел.\n\n"
+            "Пример: `-1001234567890 777`",
+            parse_mode="Markdown",
+        )
+
     elif data == "bot_presence_toggle":
         settings = load_bot_settings()
         settings["presence_enabled"] = not settings.get("presence_enabled", True)
@@ -1440,7 +1897,43 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = state.get("cid")
     text = None
 
-    if state["mode"] == "presence_time":
+    if state["mode"] == "binance_keywords":
+        settings = load_bot_settings()
+        if new_input == "0":
+            keywords = []
+        else:
+            keywords = parse_keyword_list(new_input)
+            if not keywords:
+                await update.message.reply_text("❌ Укажите хотя бы одно ключевое слово.")
+                return
+        settings["binance_announcements_keywords"] = keywords
+        save_bot_settings(settings)
+        text = (
+            "✅ Ключевые слова Binance очищены."
+            if not keywords else
+            "✅ Ключевые слова Binance: " + ", ".join(keywords)
+        )
+
+    elif state["mode"] == "binance_target":
+        parsed_target = parse_chat_topic_target(new_input)
+        if not parsed_target:
+            await update.message.reply_text(
+                "❌ Введите ID чата и положительный ID топика через пробел.\n"
+                "Пример: `-1001234567890 777`",
+                parse_mode="Markdown",
+            )
+            return
+        target_chat_id, target_topic_id = parsed_target
+        settings = load_bot_settings()
+        settings["binance_announcements_target_chat_id"] = target_chat_id
+        settings["binance_announcements_target_topic_id"] = target_topic_id
+        save_bot_settings(settings)
+        text = (
+            f"✅ Binance Announcements будут отправляться в чат `{target_chat_id}`, "
+            f"топик `{target_topic_id}`."
+        )
+
+    elif state["mode"] == "presence_time":
         parsed = parse_presence_time_range(new_input)
         if not parsed:
             await update.message.reply_text(
@@ -1982,6 +2475,8 @@ async def main():
     bot_app.add_handler(CommandHandler("bindtopic", cmd_bindtopic))
     bot_app.add_handler(CommandHandler("backup", cmd_backup))
     bot_app.add_handler(CommandHandler("restore", cmd_restore))
+    bot_app.add_handler(CommandHandler("announcements", cmd_announcements))
+    bot_app.add_handler(CommandHandler("ann", cmd_announcements))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_document))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
@@ -2009,6 +2504,7 @@ async def main():
 
     await client.start()
     presence_task = asyncio.create_task(presence_emulation_loop())
+    binance_announcements_task = asyncio.create_task(binance_announcements_loop())
     logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
     try:
@@ -2017,15 +2513,68 @@ async def main():
             await client.run_until_disconnected()
     finally:
         presence_task.cancel()
-        try:
-            await presence_task
-        except asyncio.CancelledError:
-            pass
+        binance_announcements_task.cancel()
+        await asyncio.gather(
+            presence_task,
+            binance_announcements_task,
+            return_exceptions=True,
+        )
         try:
             await set_account_presence(False)
             logger.info("[PRESENCE] Аккаунт переведен в offline перед остановкой")
         except Exception as e:
             logger.warning(f"[PRESENCE] Не удалось перевести аккаунт в offline при остановке: {e}")
+
+async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    query_text = " ".join(context.args).strip()
+    keywords = parse_keyword_list(query_text)
+    if not keywords:
+        keywords = load_bot_settings().get("binance_announcements_keywords", [])
+    if not keywords:
+        await update.message.reply_text(
+            "Укажите ключи через запятую:\n"
+            "/announcements HYPE, delist"
+        )
+        return
+
+    await update.message.reply_text("⏳ Запрашиваю последние анонсы Binance...")
+    try:
+        articles = await fetch_binance_announcements()
+    except Exception as e:
+        logger.error(f"[BINANCE SEARCH ERROR] {e}")
+        await update.message.reply_text("❌ Binance API сейчас недоступен. Попробуйте позже.")
+        return
+
+    matches = await search_binance_announcements(articles, keywords, limit=10)
+    if not matches:
+        await update.message.reply_text(
+            "Совпадений среди последних анонсов не найдено. "
+            "Поиск выполнен по заголовку, категории и тексту."
+        )
+        return
+
+    lines = [
+        "🟨 <b>Последние Binance Announcements</b>",
+        "Ключи: " + ", ".join(f"<code>{escape(keyword)}</code>" for keyword in keywords),
+        "",
+    ]
+    for index, article in enumerate(matches, 1):
+        url = escape(binance_announcement_url(article["code"]), quote=True)
+        title = escape(article["title"])
+        category = escape(article.get("category") or "Без категории")
+        date_text = format_binance_announcement_date(article["release_date"])
+        lines.append(f'{index}. <a href="{url}">{title}</a>')
+        lines.append(f"{category} · {date_text}")
+        lines.append("")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
