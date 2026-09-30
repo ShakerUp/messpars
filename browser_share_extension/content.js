@@ -6,7 +6,6 @@
 
   const HOST_ID = 'telegram-page-sender-root';
   let settings = null;
-  let lastUrl = '';
 
   const styles = `
     :host {
@@ -129,34 +128,14 @@
   }
 
   function findSocketAnchor() {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (!node.textContent?.trim().includes('FUNDOOR SOCKET')) {
-        continue;
-      }
-      let element = node.parentElement;
-      while (element && element !== document.body) {
-        const rect = element.getBoundingClientRect();
-        const text = element.textContent?.trim() || '';
-        if (rect.width >= 100 && rect.width <= 280
-            && rect.height >= 25 && rect.height <= 90
-            && text.includes('FUNDOOR SOCKET') && /\blive\b/i.test(text)) {
-          return element;
-        }
-        element = element.parentElement;
-      }
-    }
-    return null;
+    const anchor = document.querySelector('#chartHeaderBar .chb-socket');
+    return /fundoor socket/i.test(anchor?.querySelector('.chb-col-label')?.textContent || '')
+      ? anchor
+      : null;
   }
 
-  function createUi() {
+  function createUi(anchor) {
     if (document.getElementById(HOST_ID) || !isAllowedPage()) {
-      return;
-    }
-
-    const anchor = findSocketAnchor();
-    if (!anchor) {
       return;
     }
 
@@ -238,17 +217,17 @@
 
   function syncUi() {
     const host = document.getElementById(HOST_ID);
-    if (location.href === lastUrl && host && host.previousElementSibling?.textContent?.includes('FUNDOOR SOCKET')) {
+    if (!isAllowedPage()) {
+      removeUi();
       return;
     }
-    lastUrl = location.href;
-    if (isAllowedPage()) {
-      if (host && !host.previousElementSibling?.textContent?.includes('FUNDOOR SOCKET')) {
-        removeUi();
-      }
-      createUi();
-    } else {
+
+    const anchor = findSocketAnchor();
+    if (host && host.previousElementSibling !== anchor) {
       removeUi();
+    }
+    if (anchor) {
+      createUi(anchor);
     }
   }
 
