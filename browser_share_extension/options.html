@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telegram Page Sender</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="mark">TG</div>
+      <div>
+        <h1>Telegram Page Sender</h1>
+        <p>Настройки страницы и защищённого relay</p>
+      </div>
+    </header>
+
+    <form id="settings-form">
+      <label>
+        Адрес страницы Fundoor
+        <input id="page-url-prefix" type="url" placeholder="https://fundoor.pro/spreadchart" required>
+      </label>
+
+      <label>
+        HTTPS-адрес relay
+        <input id="relay-url" type="url" placeholder="https://bot.example.com/browser-share" required>
+      </label>
+
+      <label>
+        Relay secret
+        <input id="relay-secret" type="password" autocomplete="new-password" minlength="24" required>
+      </label>
+
+      <label>
+        Текст по умолчанию
+        <textarea id="default-text" rows="5" placeholder="Текст, который будет предложен при нажатии кнопки"></textarea>
+      </label>
+
+      <div class="actions">
+        <span id="status" role="status"></span>
+        <button type="submit">Сохранить</button>
+      </div>
+    </form>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -8,10 +8,15 @@ import sqlite3
 import logging
 import zipfile
 import random
+import hmac
+import threading
+import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime, timezone, timedelta, time as dt_time
 from html import escape, unescape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dotenv import load_dotenv
 
 from telethon import TelegramClient, events
@@ -89,6 +94,17 @@ BINANCE_ANNOUNCEMENTS_DETAIL_URL = (
     "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
 )
 
+# ====== BROWSER SHARE RELAY CONFIG ======
+BROWSER_RELAY_ENABLED = os.getenv("BROWSER_RELAY_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+BROWSER_RELAY_HOST = os.getenv("BROWSER_RELAY_HOST", "127.0.0.1").strip()
+BROWSER_RELAY_PORT = int(os.getenv("BROWSER_RELAY_PORT", "8765"))
+BROWSER_RELAY_PATH = "/" + os.getenv("BROWSER_RELAY_PATH", "browser-share").strip("/")
+BROWSER_RELAY_SECRET = os.getenv("BROWSER_RELAY_SECRET", "").strip()
+BROWSER_RELAY_MAX_BODY_BYTES = 16 * 1024
+BROWSER_RELAY_REQUEST_TIMEOUT = 25
+
 DEFAULT_BOT_SETTINGS = {
     "presence_enabled": PRESENCE_ENABLED,
     "presence_online_from": PRESENCE_ONLINE_FROM_KYIV,
@@ -97,6 +113,8 @@ DEFAULT_BOT_SETTINGS = {
     "binance_announcements_keywords": [],
     "binance_announcements_target_chat_id": None,
     "binance_announcements_target_topic_id": None,
+    "browser_share_target_chat_id": None,
+    "browser_share_target_topic_id": None,
 }
 
 # ====== БЛОКИРОВКА ДЛЯ ЗАПИСИ В КОНФИГ/БД ПРИ RESTORE ======
@@ -120,6 +138,8 @@ DISPLAY_MODE = "compact"
 
 client = None
 bot_app = None
+browser_relay_server = None
+browser_relay_thread = None
 
 SYSTEM_IDS = [777000, 1000, 1087968824]
 EXCLUDED_SENDERS = [int(BOT_TOKEN.split(':')[0]), DEFAULT_TARGET_CHAT_ID] + SYSTEM_IDS
@@ -154,6 +174,8 @@ def load_bot_settings() -> dict:
     for key in (
         "binance_announcements_target_chat_id",
         "binance_announcements_target_topic_id",
+        "browser_share_target_chat_id",
+        "browser_share_target_topic_id",
     ):
         try:
             settings[key] = int(settings[key]) if settings.get(key) is not None else None
@@ -203,6 +225,18 @@ def parse_chat_topic_target(text: str) -> tuple[int, int] | None:
         return None
     chat_id, topic_id = int(match.group(1)), int(match.group(2))
     if topic_id <= 0:
+        return None
+    return chat_id, topic_id
+
+def parse_optional_chat_topic_target(text: str) -> tuple[int, int | None] | None:
+    match = re.match(r"^\s*(-?\d+)(?:\s+(\d+))?\s*$", text or "")
+    if not match:
+        return None
+    chat_id = int(match.group(1))
+    topic_id = int(match.group(2)) if match.group(2) else None
+    if chat_id == 0:
+        return None
+    if topic_id is not None and topic_id <= 0:
         return None
     return chat_id, topic_id
 
@@ -601,6 +635,189 @@ async def binance_announcements_loop():
             wait_for = min(300, BINANCE_ANNOUNCEMENTS_POLL_SECONDS * (2 ** min(failures, 4)))
             logger.error(f"[BINANCE ERROR] {e}; повтор через {wait_for} сек")
             await asyncio.sleep(wait_for)
+
+# ====== BROWSER SHARE RELAY ======
+
+class BrowserShareConfigError(RuntimeError):
+    pass
+
+def validate_browser_share_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Ожидается JSON-объект")
+
+    url = str(payload.get("url") or "").strip()
+    text = str(payload.get("text") or "").strip()
+    title = str(payload.get("title") or "").strip()
+
+    if not url or len(url) > 3500:
+        raise ValueError("Некорректная длина URL")
+    parsed_url = urllib.parse.urlsplit(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise ValueError("Разрешены только полные http/https URL")
+    if parsed_url.username or parsed_url.password:
+        raise ValueError("URL с логином или паролем запрещён")
+    if len(text) > 2500:
+        raise ValueError("Текст длиннее 2500 символов")
+    if len(title) > 300:
+        title = title[:300].rstrip()
+
+    return {"url": url, "text": text, "title": title}
+
+async def send_browser_share_message(payload: dict):
+    clean = validate_browser_share_payload(payload)
+    settings = load_bot_settings()
+    target_chat_id = settings.get("browser_share_target_chat_id")
+    target_topic_id = settings.get("browser_share_target_topic_id")
+    if target_chat_id is None:
+        raise BrowserShareConfigError("В боте не настроен целевой чат")
+
+    parts = []
+    if clean["text"]:
+        parts.append(escape(clean["text"]))
+    if clean["title"]:
+        parts.append(f"<b>{escape(clean['title'])}</b>")
+    safe_url = escape(clean["url"], quote=True)
+    parts.append(f'<a href="{safe_url}">Открыть страницу</a>')
+
+    send_kwargs = {
+        "chat_id": target_chat_id,
+        "text": "\n\n".join(parts),
+        "parse_mode": "HTML",
+    }
+    if target_topic_id is not None:
+        send_kwargs["message_thread_id"] = target_topic_id
+    await bot_app.bot.send_message(**send_kwargs)
+
+class BrowserShareRelayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    _rate_lock = threading.Lock()
+    _recent_requests = deque()
+
+    def _send_json(self, status: int, payload: dict):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _is_authorized(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        provided = header[7:].strip()
+        return bool(provided) and hmac.compare_digest(provided, BROWSER_RELAY_SECRET)
+
+    @classmethod
+    def _rate_limit_ok(cls) -> bool:
+        now = time.monotonic()
+        with cls._rate_lock:
+            while cls._recent_requests and now - cls._recent_requests[0] > 60:
+                cls._recent_requests.popleft()
+            if len(cls._recent_requests) >= 30:
+                return False
+            cls._recent_requests.append(now)
+            return True
+
+    def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path != BROWSER_RELAY_PATH:
+            self._send_json(404, {"ok": False, "error": "Маршрут не найден"})
+            return
+        if not self._is_authorized():
+            self._send_json(401, {"ok": False, "error": "Неверный relay secret"})
+            return
+        if not self._rate_limit_ok():
+            self._send_json(429, {"ok": False, "error": "Слишком много запросов"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        if content_length <= 0 or content_length > BROWSER_RELAY_MAX_BODY_BYTES:
+            self._send_json(413, {"ok": False, "error": "Некорректный размер запроса"})
+            return
+
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            clean = validate_browser_share_payload(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            send_browser_share_message(clean),
+            self.server.event_loop,
+        )
+        try:
+            future.result(timeout=BROWSER_RELAY_REQUEST_TIMEOUT)
+        except BrowserShareConfigError as e:
+            self._send_json(503, {"ok": False, "error": str(e)})
+            return
+        except TimeoutError:
+            future.cancel()
+            self._send_json(504, {"ok": False, "error": "Бот не ответил вовремя"})
+            return
+        except Exception as e:
+            logger.error(f"[BROWSER RELAY SEND ERROR] {e}")
+            self._send_json(502, {"ok": False, "error": "Не удалось отправить сообщение"})
+            return
+
+        logger.info(f"[BROWSER RELAY] Отправлена страница: {clean['url']}")
+        self._send_json(200, {"ok": True})
+
+    def log_message(self, fmt, *args):
+        logger.info(f"[BROWSER RELAY HTTP] {self.address_string()} {fmt % args}")
+
+def start_browser_share_relay(event_loop):
+    global browser_relay_server, browser_relay_thread
+    if not BROWSER_RELAY_ENABLED:
+        logger.info("[BROWSER RELAY] Выключен в .env")
+        return
+    if len(BROWSER_RELAY_SECRET) < 24:
+        logger.error("[BROWSER RELAY] Не запущен: BROWSER_RELAY_SECRET должен быть не короче 24 символов")
+        return
+
+    try:
+        server = ThreadingHTTPServer(
+            (BROWSER_RELAY_HOST, BROWSER_RELAY_PORT),
+            BrowserShareRelayHandler,
+        )
+    except OSError as e:
+        logger.error(f"[BROWSER RELAY] Не удалось запустить HTTP server: {e}")
+        return
+
+    server.daemon_threads = True
+    server.event_loop = event_loop
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.25},
+        name="browser-share-relay",
+        daemon=True,
+    )
+    browser_relay_server = server
+    browser_relay_thread = thread
+    thread.start()
+    logger.info(
+        f"[BROWSER RELAY] Слушает http://{BROWSER_RELAY_HOST}:"
+        f"{BROWSER_RELAY_PORT}{BROWSER_RELAY_PATH}"
+    )
+
+async def stop_browser_share_relay():
+    global browser_relay_server, browser_relay_thread
+    server = browser_relay_server
+    thread = browser_relay_thread
+    browser_relay_server = None
+    browser_relay_thread = None
+    if not server:
+        return
+    await asyncio.to_thread(server.shutdown)
+    server.server_close()
+    if thread:
+        await asyncio.to_thread(thread.join, 2)
+    logger.info("[BROWSER RELAY] Остановлен")
 
 def render_message_html(msg) -> str:
     """
@@ -1528,6 +1745,7 @@ async def show_bot_menu(query):
         )],
         [InlineKeyboardButton("🕘 ИЗМЕНИТЬ ВРЕМЯ ONLINE", callback_data="bot_presence_time")],
         [InlineKeyboardButton("🟨 BINANCE ANNOUNCEMENTS", callback_data="bot_binance_settings")],
+        [InlineKeyboardButton("🌐 КНОПКА В БРАУЗЕРЕ", callback_data="bot_browser_share_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
     ]
 
@@ -1535,6 +1753,38 @@ async def show_bot_menu(query):
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
+    )
+
+async def show_browser_share_menu(query):
+    settings = load_bot_settings()
+    target_chat_id = settings.get("browser_share_target_chat_id")
+    target_topic_id = settings.get("browser_share_target_topic_id")
+    relay_ready = browser_relay_server is not None
+    if target_chat_id is None:
+        target_text = "не задан"
+    elif target_topic_id is None:
+        target_text = f"<code>{target_chat_id}</code> (без топика)"
+    else:
+        target_text = f"<code>{target_chat_id}</code> / topic <code>{target_topic_id}</code>"
+
+    endpoint = (
+        f"http://{BROWSER_RELAY_HOST}:{BROWSER_RELAY_PORT}{BROWSER_RELAY_PATH}"
+    )
+    text = (
+        "🌐 <b>Кнопка в браузере</b>\n\n"
+        f"Relay: {'✅ ВКЛ' if relay_ready else '⛔ ВЫКЛ'}\n"
+        f"Куда отправлять: {target_text}\n"
+        f"Локальный endpoint: <code>{escape(endpoint)}</code>\n\n"
+        "Публичный HTTPS-адрес и секрет задаются в настройках расширения."
+    )
+    keyboard = [
+        [InlineKeyboardButton("🎯 ИЗМЕНИТЬ ЧАТ / ТОПИК", callback_data="bot_browser_share_target")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="bot_settings")],
+    ]
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
     )
 
 async def show_binance_announcements_menu(query):
@@ -1717,6 +1967,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "bot_settings":
         await show_bot_menu(query)
 
+    elif data == "bot_browser_share_settings":
+        await show_browser_share_menu(query)
+
+    elif data == "bot_browser_share_target":
+        user_edit_state[query.from_user.id] = {"mode": "browser_share_target"}
+        await query.message.reply_text(
+            "📝 Введите ID чата и, если нужен, ID топика через пробел.\n\n"
+            "С топиком: `-1001234567890 777`\n"
+            "Без топика: `-1001234567890`",
+            parse_mode="Markdown",
+        )
+
     elif data == "bot_binance_settings":
         await show_binance_announcements_menu(query)
 
@@ -1897,7 +2159,24 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = state.get("cid")
     text = None
 
-    if state["mode"] == "binance_keywords":
+    if state["mode"] == "browser_share_target":
+        parsed_target = parse_optional_chat_topic_target(new_input)
+        if not parsed_target:
+            await update.message.reply_text(
+                "❌ Введите ID чата и необязательный положительный ID топика.\n"
+                "Пример: `-1001234567890 777`",
+                parse_mode="Markdown",
+            )
+            return
+        target_chat_id, target_topic_id = parsed_target
+        settings = load_bot_settings()
+        settings["browser_share_target_chat_id"] = target_chat_id
+        settings["browser_share_target_topic_id"] = target_topic_id
+        save_bot_settings(settings)
+        topic_text = f", топик `{target_topic_id}`" if target_topic_id else " без топика"
+        text = f"✅ Ссылки из браузера будут отправляться в чат `{target_chat_id}`{topic_text}."
+
+    elif state["mode"] == "binance_keywords":
         settings = load_bot_settings()
         if new_input == "0":
             keywords = []
@@ -2505,6 +2784,7 @@ async def main():
     await client.start()
     presence_task = asyncio.create_task(presence_emulation_loop())
     binance_announcements_task = asyncio.create_task(binance_announcements_loop())
+    start_browser_share_relay(asyncio.get_running_loop())
     logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
     try:
@@ -2512,6 +2792,7 @@ async def main():
             await bot_app.updater.start_polling()
             await client.run_until_disconnected()
     finally:
+        await stop_browser_share_relay()
         presence_task.cancel()
         binance_announcements_task.cancel()
         await asyncio.gather(
