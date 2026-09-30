@@ -671,22 +671,14 @@ async def send_browser_share_message(payload: dict):
     if target_chat_id is None:
         raise BrowserShareConfigError("В боте не настроен целевой чат")
 
-    parts = []
-    if clean["text"]:
-        parts.append(escape(clean["text"]))
-    if clean["title"]:
-        parts.append(f"<b>{escape(clean['title'])}</b>")
-    safe_url = escape(clean["url"], quote=True)
-    parts.append(f'<a href="{safe_url}">Открыть страницу</a>')
-
     send_kwargs = {
         "chat_id": target_chat_id,
-        "text": "\n\n".join(parts),
-        "parse_mode": "HTML",
     }
     if target_topic_id is not None:
         send_kwargs["message_thread_id"] = target_topic_id
-    await bot_app.bot.send_message(**send_kwargs)
+    await bot_app.bot.send_message(text=clean["url"], **send_kwargs)
+    if clean["text"]:
+        await bot_app.bot.send_message(text=clean["text"], **send_kwargs)
 
 class BrowserShareRelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
