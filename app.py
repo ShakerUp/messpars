@@ -25,7 +25,8 @@ from telethon.extensions import html as telethon_html
 from telethon.tl.functions.account import UpdateStatusRequest
 from telethon.tl.types import (
     User, Chat, Channel, MessageActionTopicCreate,
-    MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
+    MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage,
+    MessageEntityBotCommand,
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
@@ -671,6 +672,17 @@ async def send_browser_share_message(payload: dict):
     if target_chat_id is None:
         raise BrowserShareConfigError("В боте не настроен целевой чат")
 
+    if clean["text"]:
+        try:
+            target_peer = await client.get_input_entity(target_chat_id)
+        except ValueError as exc:
+            await client.get_dialogs(limit=200)
+            try:
+                target_peer = await client.get_input_entity(target_chat_id)
+            except ValueError:
+                raise BrowserShareConfigError("Аккаунт миррора не видит целевой чат") from exc
+        sender_peer = await client.get_input_entity("me")
+
     send_kwargs = {
         "chat_id": target_chat_id,
     }
@@ -678,7 +690,20 @@ async def send_browser_share_message(payload: dict):
         send_kwargs["message_thread_id"] = target_topic_id
     await bot_app.bot.send_message(text=clean["url"], **send_kwargs)
     if clean["text"]:
-        await bot_app.bot.send_message(text=clean["text"], **send_kwargs)
+        command = clean["text"].split(maxsplit=1)[0]
+        entities = (
+            [MessageEntityBotCommand(offset=0, length=len(command))]
+            if re.fullmatch(r"/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?", command)
+            else None
+        )
+        await client.send_message(
+            target_peer,
+            clean["text"],
+            reply_to=target_topic_id if target_topic_id and target_topic_id > 1 else None,
+            parse_mode=None,
+            formatting_entities=entities,
+            send_as=sender_peer,
+        )
 
 class BrowserShareRelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -2441,6 +2466,10 @@ async def send_to_target(
 
 async def telethon_handler(event):
     msg = event.message
+    if event.out:
+        browser_target_chat_id = load_bot_settings().get("browser_share_target_chat_id")
+        if event.chat_id == browser_target_chat_id:
+            return
     if msg.sender_id in EXCLUDED_SENDERS:
         return
 
