@@ -1403,26 +1403,30 @@ async def get_source_topic_title(chat, source_top_id, chat_conf=None, msg=None) 
     return None
 
 def resolve_source_topic_id(msg, chat=None, chat_conf=None) -> int:
+    is_forum = isinstance(chat, Channel) and getattr(chat, 'forum', False)
     if getattr(msg, 'message_thread_id', None):
-        return int(msg.message_thread_id)
+        topic_id = int(msg.message_thread_id)
+        return 0 if is_forum and topic_id <= 1 else topic_id
 
     reply_to = getattr(msg, 'reply_to', None)
+    # reply_to_top_id also exists for ordinary reply chains inside General.
     if not reply_to:
+        return 0
+    forum_topic = getattr(reply_to, 'forum_topic', None)
+    if is_forum and forum_topic is not True:
         return 0
 
     if getattr(reply_to, 'reply_to_top_id', None):
-        return int(reply_to.reply_to_top_id)
+        topic_id = int(reply_to.reply_to_top_id)
+        return 0 if is_forum and topic_id <= 1 else topic_id
 
     if getattr(reply_to, 'reply_to_msg_id', None):
-        candidate = int(reply_to.reply_to_msg_id)
+        topic_id = int(reply_to.reply_to_msg_id)
         known_topics = (chat_conf or {}).get('topics', {})
-        is_forum = isinstance(chat, Channel) and getattr(chat, 'forum', False)
-        forum_topic = getattr(reply_to, 'forum_topic', None)
-        # В forum-чате только forum_topic=True подтверждает, что candidate — корень ветки.
-        if str(candidate) in known_topics and (not is_forum or forum_topic is True):
-            return candidate
+        if str(topic_id) in known_topics and (not is_forum or forum_topic is True):
+            return 0 if is_forum and topic_id <= 1 else topic_id
         if is_forum and forum_topic is True:
-            return candidate
+            return 0 if topic_id <= 1 else topic_id
 
     return 0
 
