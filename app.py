@@ -124,6 +124,7 @@ DEFAULT_BOT_SETTINGS = {
     "presence_online_until": PRESENCE_ONLINE_UNTIL_KYIV,
     "binance_announcements_enabled": False,
     "exchange_dividends_enabled": False,
+    "announcements_enabled": False,
     "binance_announcements_keywords": [],
     "binance_announcements_target_chat_id": None,
     "binance_announcements_target_topic_id": None,
@@ -167,10 +168,12 @@ def load_bot_settings() -> dict:
     settings = DEFAULT_BOT_SETTINGS.copy()
     if not os.path.exists(BOT_SETTINGS_FILE):
         return settings
+    saved = {}
     try:
         with open(BOT_SETTINGS_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if isinstance(saved, dict):
+            raw_saved = json.load(f)
+        if isinstance(raw_saved, dict):
+            saved = raw_saved
             settings.update({k: saved[k] for k in settings.keys() if k in saved})
     except Exception as e:
         logger.warning(f"[BOT SETTINGS] Не удалось прочитать {BOT_SETTINGS_FILE}: {e}")
@@ -181,6 +184,11 @@ def load_bot_settings() -> dict:
         settings.get("binance_announcements_enabled")
     )
     settings["exchange_dividends_enabled"] = bool(settings.get("exchange_dividends_enabled"))
+    settings["announcements_enabled"] = (
+        bool(settings.get("announcements_enabled"))
+        if "announcements_enabled" in saved else
+        settings["binance_announcements_enabled"] or settings["exchange_dividends_enabled"]
+    )
     raw_keywords = settings.get("binance_announcements_keywords", [])
     settings["binance_announcements_keywords"] = (
         [str(value).strip() for value in raw_keywords if str(value).strip()]
@@ -571,12 +579,12 @@ async def binance_announcements_loop():
     while True:
         try:
             settings = load_bot_settings()
-            if not settings.get("binance_announcements_enabled"):
+            if not settings.get("announcements_enabled"):
                 failures = 0
                 await asyncio.sleep(30)
                 continue
 
-            keywords = settings.get("binance_announcements_keywords", [])
+            keywords = expand_announcement_keywords(settings.get("binance_announcements_keywords", []))
             target_chat_id = settings.get("binance_announcements_target_chat_id")
             target_topic_id = settings.get("binance_announcements_target_topic_id")
             if not keywords or target_chat_id is None or target_topic_id is None:
@@ -823,8 +831,31 @@ def save_exchange_announcements_state(source: str, state: dict):
         json.dump(state, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, path)
 
-async def send_exchange_announcement_notification(article: dict, settings: dict):
-    matched = exchange_announcement_matches(article, ["dividend", "дивиденд"])
+def migrate_announcements_settings():
+    if not os.path.exists(BOT_SETTINGS_FILE):
+        return
+    try:
+        with open(BOT_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception as e:
+        logger.warning(f"[ANNOUNCEMENTS] Не удалось проверить старые настройки: {e}")
+        return
+    if not isinstance(saved, dict) or "announcements_enabled" in saved:
+        return
+
+    if saved.get("binance_announcements_enabled") and not saved.get("exchange_dividends_enabled"):
+        for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES:
+            state = load_exchange_announcements_state(source)
+            state["reseed_required"] = True
+            save_exchange_announcements_state(source, state)
+    elif saved.get("exchange_dividends_enabled") and not saved.get("binance_announcements_enabled"):
+        request_binance_announcements_reseed()
+
+    settings = load_bot_settings()
+    save_bot_settings(settings)
+    logger.info("[ANNOUNCEMENTS] Старые настройки мониторов объединены")
+
+async def send_exchange_announcement_notification(article: dict, matched: list[str], settings: dict):
     text = (
         f"<b>{escape(article['source'])} Announcement</b>\n\n"
         f"<b>{escape(article['title'])}</b>\n"
@@ -839,18 +870,19 @@ async def send_exchange_announcement_notification(article: dict, settings: dict)
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
-async def exchange_dividends_loop(source: str):
+async def exchange_announcements_loop(source: str):
     failures = 0
-    logger.info(f"[{source.upper()}] Монитор дивидендов запущен")
+    logger.info(f"[{source.upper()}] Монитор анонсов запущен")
     while True:
         try:
             settings = load_bot_settings()
-            if not settings.get("exchange_dividends_enabled"):
+            if not settings.get("announcements_enabled"):
                 failures = 0
                 await asyncio.sleep(30)
                 continue
-            if settings.get("binance_announcements_target_chat_id") is None or settings.get("binance_announcements_target_topic_id") is None:
-                logger.warning(f"[{source.upper()}] Не настроен целевой чат/топик")
+            keywords = expand_announcement_keywords(settings.get("binance_announcements_keywords", []))
+            if not keywords or settings.get("binance_announcements_target_chat_id") is None or settings.get("binance_announcements_target_topic_id") is None:
+                logger.warning(f"[{source.upper()}] Не настроены ключи или целевой чат/топик")
                 await asyncio.sleep(60)
                 continue
             articles = await fetch_exchange_announcements(source)
@@ -869,9 +901,10 @@ async def exchange_dividends_loop(source: str):
             for article in reversed(articles):
                 if article["code"] in seen:
                     continue
-                if exchange_announcement_matches(article, ["dividend", "дивиденд"]):
+                matched = exchange_announcement_matches(article, keywords)
+                if matched:
                     try:
-                        await send_exchange_announcement_notification(article, settings)
+                        await send_exchange_announcement_notification(article, matched, settings)
                     except Exception as e:
                         logger.error(f"[{source.upper()} SEND ERROR] {article['code']}: {e}")
                         continue
@@ -2090,8 +2123,7 @@ async def show_browser_share_menu(query):
 
 async def show_binance_announcements_menu(query):
     settings = load_bot_settings()
-    enabled = settings.get("binance_announcements_enabled", False)
-    dividends_enabled = settings.get("exchange_dividends_enabled", False)
+    enabled = settings.get("announcements_enabled", False)
     keywords = settings.get("binance_announcements_keywords", [])
     target_chat_id = settings.get("binance_announcements_target_chat_id")
     target_topic_id = settings.get("binance_announcements_target_topic_id")
@@ -2104,9 +2136,8 @@ async def show_binance_announcements_menu(query):
     )
     text = (
         "📰 <b>Анонсы бирж</b>\n\n"
-        f"Binance: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
-        f"Ключевые слова Binance: {keywords_text}\n"
-        f"Bitget + Gate (дивиденды): {'✅ ВКЛ' if dividends_enabled else '⛔ ВЫКЛ'}\n"
+        f"Binance, Bitget, Gate: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
+        f"Ключевые слова: {keywords_text}\n"
         f"Куда отправлять: {target_text}\n"
         f"Интервал: Binance {BINANCE_ANNOUNCEMENTS_POLL_SECONDS} сек., "
         f"Bitget/Gate {EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS} сек.\n\n"
@@ -2116,10 +2147,6 @@ async def show_binance_announcements_menu(query):
         [InlineKeyboardButton(
             "⛔ ВЫКЛЮЧИТЬ МОНИТОР" if enabled else "✅ ВКЛЮЧИТЬ МОНИТОР",
             callback_data="bot_binance_toggle",
-        )],
-        [InlineKeyboardButton(
-            "⛔ ВЫКЛЮЧИТЬ BITGET/GATE" if dividends_enabled else "✅ ВКЛЮЧИТЬ BITGET/GATE",
-            callback_data="bot_exchange_dividends_toggle",
         )],
         [InlineKeyboardButton("🔎 ИЗМЕНИТЬ КЛЮЧИ", callback_data="bot_binance_keywords")],
         [InlineKeyboardButton("🎯 ИЗМЕНИТЬ ЧАТ / ТОПИК", callback_data="bot_binance_target")],
@@ -2292,7 +2319,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "bot_binance_toggle":
         settings = load_bot_settings()
-        currently_enabled = settings.get("binance_announcements_enabled", False)
+        currently_enabled = settings.get("announcements_enabled", False)
         if not currently_enabled:
             missing = []
             if not settings.get("binance_announcements_keywords"):
@@ -2308,32 +2335,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_binance_announcements_menu(query)
                 return
             request_binance_announcements_reseed()
-
-        settings["binance_announcements_enabled"] = not currently_enabled
-        save_bot_settings(settings)
-        await show_binance_announcements_menu(query)
-
-    elif data == "bot_exchange_dividends_toggle":
-        settings = load_bot_settings()
-        if not settings["exchange_dividends_enabled"]:
-            if settings["binance_announcements_target_chat_id"] is None or settings["binance_announcements_target_topic_id"] is None:
-                await query.message.reply_text("❌ Сначала настройте целевой чат и топик.")
-                await show_binance_announcements_menu(query)
-                return
             for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES:
                 state = load_exchange_announcements_state(source)
                 state["reseed_required"] = True
                 save_exchange_announcements_state(source, state)
-        settings["exchange_dividends_enabled"] = not settings["exchange_dividends_enabled"]
+
+        settings["announcements_enabled"] = not currently_enabled
         save_bot_settings(settings)
+        await show_binance_announcements_menu(query)
+
+    elif data == "bot_exchange_dividends_toggle":
+        # Старые сообщения с двумя переключателями могут оставаться в Telegram.
         await show_binance_announcements_menu(query)
 
     elif data == "bot_binance_keywords":
         user_edit_state[query.from_user.id] = {"mode": "binance_keywords"}
         await query.message.reply_text(
             "📝 Введите ключевые слова через запятую или каждое с новой строки.\n\n"
-            "Совпадение любого ключа отправит уведомление.\n"
-            "Пример: `HYPE, delist, perpetual contract`\n"
+            "Все три биржи проверяют эти ключи; совпадение любого отправит уведомление.\n"
+            "Пример: `dividend, split`\n"
             "Чтобы очистить список, отправьте `0`.",
             parse_mode="Markdown",
         )
@@ -2511,9 +2531,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings["binance_announcements_keywords"] = keywords
         save_bot_settings(settings)
         text = (
-            "✅ Ключевые слова Binance очищены."
+            "✅ Ключевые слова анонсов очищены."
             if not keywords else
-            "✅ Ключевые слова Binance: " + ", ".join(keywords)
+            "✅ Ключевые слова анонсов: " + ", ".join(keywords)
         )
 
     elif state["mode"] == "binance_target":
@@ -2531,7 +2551,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings["binance_announcements_target_topic_id"] = target_topic_id
         save_bot_settings(settings)
         text = (
-            f"✅ Binance Announcements будут отправляться в чат `{target_chat_id}`, "
+            f"✅ Анонсы бирж будут отправляться в чат `{target_chat_id}`, "
             f"топик `{target_topic_id}`."
         )
 
@@ -3072,6 +3092,7 @@ def log_full_message(event, tag="NEW"):
 
 async def main():
     global client, bot_app
+    migrate_announcements_settings()
     DB.init()
     prune_old_logs()
 
@@ -3112,7 +3133,7 @@ async def main():
     presence_task = asyncio.create_task(presence_emulation_loop())
     binance_announcements_task = asyncio.create_task(binance_announcements_loop())
     exchange_announcements_tasks = [
-        asyncio.create_task(exchange_dividends_loop(source))
+        asyncio.create_task(exchange_announcements_loop(source))
         for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES
     ]
     start_browser_share_relay(asyncio.get_running_loop())
