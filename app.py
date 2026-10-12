@@ -6,6 +6,7 @@ import io
 import re
 import sqlite3
 import logging
+import tempfile
 import zipfile
 import random
 import hmac
@@ -1165,21 +1166,46 @@ def prune_old_logs():
     if not os.path.exists(LOG_FILE):
         return
     cutoff = datetime.now(timezone.utc) - timedelta(days=LOG_RETENTION_DAYS)
+    tmp_path = None
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        kept = []
-        keep_current_block = False
-        for line in lines:
-            ts = parse_log_timestamp(line)
-            if ts is not None:
-                keep_current_block = ts >= cutoff
-            if keep_current_block:
-                kept.append(line)
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.writelines(kept)
+        fd, tmp_path = tempfile.mkstemp(prefix=".bot_messages_", dir=os.path.dirname(os.path.abspath(LOG_FILE)))
+        with open(LOG_FILE, "r", encoding="utf-8") as source, os.fdopen(fd, "w", encoding="utf-8") as target:
+            keep_current_block = False
+            for line in source:
+                ts = parse_log_timestamp(line)
+                if ts is not None:
+                    keep_current_block = ts >= cutoff
+                if keep_current_block:
+                    target.write(line)
+
+        file_handlers = [
+            handler for handler in logging.getLogger().handlers
+            if isinstance(handler, logging.FileHandler)
+            and os.path.normcase(os.path.abspath(handler.baseFilename))
+            == os.path.normcase(os.path.abspath(LOG_FILE))
+        ]
+        for handler in file_handlers:
+            handler.acquire()
+        try:
+            for handler in file_handlers:
+                handler.flush()
+                if handler.stream is not None:
+                    handler.stream.close()
+                    handler.stream = None
+            try:
+                os.replace(tmp_path, LOG_FILE)
+                tmp_path = None
+            finally:
+                for handler in file_handlers:
+                    handler.stream = handler._open()
+        finally:
+            for handler in reversed(file_handlers):
+                handler.release()
     except Exception as e:
         logger.error(f"[LOG PRUNE ERROR] {e}")
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 def collect_recent_logs(hours=LOG_EXPORT_HOURS) -> str:
     if not os.path.exists(LOG_FILE):
@@ -1187,20 +1213,18 @@ def collect_recent_logs(hours=LOG_EXPORT_HOURS) -> str:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     output_path = f"logs_last_{hours}h.txt"
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        selected = []
-        keep_current_block = False
-        for line in lines:
-            ts = parse_log_timestamp(line)
-            if ts is not None:
-                keep_current_block = ts >= cutoff
-            if keep_current_block:
-                selected.append(line)
-        if not selected:
-            selected = ["За последние 24 часа записей нет.\n"]
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.writelines(selected)
+        with open(LOG_FILE, "r", encoding="utf-8") as source, open(output_path, "w", encoding="utf-8") as target:
+            keep_current_block = False
+            has_lines = False
+            for line in source:
+                ts = parse_log_timestamp(line)
+                if ts is not None:
+                    keep_current_block = ts >= cutoff
+                if keep_current_block:
+                    target.write(line)
+                    has_lines = True
+            if not has_lines:
+                target.write("За последние 24 часа записей нет.\n")
         return output_path
     except Exception as e:
         logger.error(f"[LOG EXPORT ERROR] {e}")
