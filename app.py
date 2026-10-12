@@ -60,6 +60,10 @@ ADMIN_ID = 684460638
 TOPICS_DB_FILE = 'topics_mapping.json'
 BOT_SETTINGS_FILE = 'bot_settings.json'
 BINANCE_ANNOUNCEMENTS_STATE_FILE = 'binance_announcements_state.json'
+EXCHANGE_ANNOUNCEMENTS_STATE_FILES = {
+    "Bitget": "bitget_announcements_state.json",
+    "Gate": "gate_announcements_state.json",
+}
 DB_FILE = 'bot_data.db'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
@@ -94,6 +98,11 @@ BINANCE_ANNOUNCEMENTS_LIST_URLS = (
 BINANCE_ANNOUNCEMENTS_DETAIL_URL = (
     "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
 )
+BITGET_ANNOUNCEMENTS_URL = "https://api.bitget.com/api/v2/public/annoucements"
+GATE_ANNOUNCEMENTS_URL = "https://api.gateio.ws/api/v4/ann/list_article"
+EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS = max(
+    30, int(os.getenv("EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS", "60"))
+)
 
 # ====== BROWSER SHARE RELAY CONFIG ======
 BROWSER_RELAY_ENABLED = os.getenv("BROWSER_RELAY_ENABLED", "0").strip().lower() in {
@@ -111,6 +120,7 @@ DEFAULT_BOT_SETTINGS = {
     "presence_online_from": PRESENCE_ONLINE_FROM_KYIV,
     "presence_online_until": PRESENCE_ONLINE_UNTIL_KYIV,
     "binance_announcements_enabled": False,
+    "exchange_dividends_enabled": False,
     "binance_announcements_keywords": [],
     "binance_announcements_target_chat_id": None,
     "binance_announcements_target_topic_id": None,
@@ -167,6 +177,7 @@ def load_bot_settings() -> dict:
     settings["binance_announcements_enabled"] = bool(
         settings.get("binance_announcements_enabled")
     )
+    settings["exchange_dividends_enabled"] = bool(settings.get("exchange_dividends_enabled"))
     raw_keywords = settings.get("binance_announcements_keywords", [])
     settings["binance_announcements_keywords"] = (
         [str(value).strip() for value in raw_keywords if str(value).strip()]
@@ -635,6 +646,210 @@ async def binance_announcements_loop():
             failures += 1
             wait_for = min(300, BINANCE_ANNOUNCEMENTS_POLL_SECONDS * (2 ** min(failures, 4)))
             logger.error(f"[BINANCE ERROR] {e}; повтор через {wait_for} сек")
+            await asyncio.sleep(wait_for)
+
+def _exchange_http_json_sync(url: str, payload: dict | None = None) -> dict:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "TelegramMirrorBot/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+def _announcement_timestamp(value) -> int:
+    try:
+        timestamp = int(value)
+        return timestamp * 1000 if timestamp and timestamp < 10**11 else timestamp
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError):
+            return 0
+
+def parse_bitget_announcements(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict) or payload.get("code") != "00000":
+        raise ValueError("Bitget API вернул ошибку")
+    items = payload.get("data")
+    if not isinstance(items, list):
+        raise ValueError("Bitget API вернул неожиданную структуру")
+    articles = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("annId") or "").strip()
+        title = str(item.get("annTitle") or "").strip()
+        url = str(item.get("annUrl") or "").strip()
+        if code and title and url.startswith("https://www.bitget.com/"):
+            articles.append({
+                "code": code, "title": title, "url": url,
+                "category": str(item.get("annType") or ""),
+                "summary": str(item.get("annDesc") or ""),
+                "release_date": _announcement_timestamp(item.get("cTime")),
+                "source": "Bitget",
+            })
+    return articles
+
+def parse_gate_announcements(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        raise ValueError("Gate API вернул ошибку")
+    data = payload.get("data")
+    items = data.get("list") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("Gate API вернул неожиданную структуру")
+    articles = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("id") or "").strip()
+        title = str(item.get("title") or "").strip()
+        if code.isdigit() and title:
+            articles.append({
+                "code": code, "title": title,
+                "url": f"https://www.gate.com/announcements/article/{code}",
+                "category": str(item.get("cate") or ""),
+                "summary": str(item.get("brief") or ""),
+                "release_date": _announcement_timestamp(
+                    item.get("release_time") or item.get("created")
+                ),
+                "source": "Gate",
+            })
+    return articles
+
+async def fetch_exchange_announcements(source: str) -> list[dict]:
+    if source == "Bitget":
+        articles = []
+        seen_codes = set()
+        cursor = None
+        for _ in range(5):
+            params = {"language": "en_US", "limit": 10}
+            if cursor:
+                params["cursor"] = cursor
+            url = f"{BITGET_ANNOUNCEMENTS_URL}?{urllib.parse.urlencode(params)}"
+            page = parse_bitget_announcements(
+                await asyncio.to_thread(_exchange_http_json_sync, url)
+            )
+            new_articles = [article for article in page if article["code"] not in seen_codes]
+            if not new_articles:
+                break
+            articles.extend(new_articles)
+            seen_codes.update(article["code"] for article in new_articles)
+            if len(page) < 10:
+                break
+            cursor = page[-1]["code"]
+        return articles
+    if source == "Gate":
+        payload = await asyncio.to_thread(
+            _exchange_http_json_sync, GATE_ANNOUNCEMENTS_URL,
+            {"page": "1", "size": "50", "lang": "en", "pinned": 0},
+        )
+        return parse_gate_announcements(payload)
+    raise ValueError(f"Неизвестный источник: {source}")
+
+def exchange_announcement_matches(article: dict, keywords: list[str]) -> list[str]:
+    haystack = "\n".join(str(article.get(key) or "") for key in ("title", "category", "summary")).casefold()
+    return [keyword for keyword in keywords if keyword.casefold() in haystack]
+
+def expand_announcement_keywords(keywords: list[str]) -> list[str]:
+    expanded = list(keywords)
+    if any("дивиденд" in keyword.casefold() for keyword in keywords):
+        expanded.append("dividend")
+    return expanded
+
+def load_exchange_announcements_state(source: str) -> dict:
+    state = {"initialized": False, "reseed_required": False, "seen_codes": []}
+    path = EXCHANGE_ANNOUNCEMENTS_STATE_FILES[source]
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                state.update(saved)
+        except Exception as e:
+            logger.warning(f"[{source.upper()}] Не удалось прочитать state: {e}")
+    state["seen_codes"] = [str(code) for code in state["seen_codes"] if code][:1000] if isinstance(state.get("seen_codes"), list) else []
+    state["initialized"] = bool(state.get("initialized"))
+    state["reseed_required"] = bool(state.get("reseed_required"))
+    return state
+
+def save_exchange_announcements_state(source: str, state: dict):
+    path = EXCHANGE_ANNOUNCEMENTS_STATE_FILES[source]
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+async def send_exchange_announcement_notification(article: dict, settings: dict):
+    matched = exchange_announcement_matches(article, ["dividend", "дивиденд"])
+    text = (
+        f"<b>{escape(article['source'])} Announcement</b>\n\n"
+        f"<b>{escape(article['title'])}</b>\n"
+        f"Дата: {format_binance_announcement_date(article['release_date'])}\n"
+        f"Совпадение: {', '.join(f'<code>{escape(key)}</code>' for key in matched)}\n\n"
+        f'<a href="{escape(article["url"], quote=True)}">Открыть анонс</a>'
+    )
+    await bot_app.bot.send_message(
+        chat_id=settings["binance_announcements_target_chat_id"],
+        message_thread_id=settings["binance_announcements_target_topic_id"],
+        text=text, parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+async def exchange_dividends_loop(source: str):
+    failures = 0
+    logger.info(f"[{source.upper()}] Монитор дивидендов запущен")
+    while True:
+        try:
+            settings = load_bot_settings()
+            if not settings.get("exchange_dividends_enabled"):
+                failures = 0
+                await asyncio.sleep(30)
+                continue
+            if settings.get("binance_announcements_target_chat_id") is None or settings.get("binance_announcements_target_topic_id") is None:
+                logger.warning(f"[{source.upper()}] Не настроен целевой чат/топик")
+                await asyncio.sleep(60)
+                continue
+            articles = await fetch_exchange_announcements(source)
+            if not articles:
+                raise ValueError("пустая лента анонсов")
+            failures = 0
+            state = load_exchange_announcements_state(source)
+            current_codes = [article["code"] for article in articles]
+            if not state["initialized"] or state["reseed_required"]:
+                state.update({"initialized": True, "reseed_required": False, "seen_codes": current_codes})
+                save_exchange_announcements_state(source, state)
+                logger.info(f"[{source.upper()}] Базовая лента сохранена ({len(current_codes)} анонсов)")
+                await asyncio.sleep(EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS)
+                continue
+            seen = set(state["seen_codes"])
+            for article in reversed(articles):
+                if article["code"] in seen:
+                    continue
+                if exchange_announcement_matches(article, ["dividend", "дивиденд"]):
+                    try:
+                        await send_exchange_announcement_notification(article, settings)
+                    except Exception as e:
+                        logger.error(f"[{source.upper()} SEND ERROR] {article['code']}: {e}")
+                        continue
+                seen.add(article["code"])
+            state["seen_codes"] = ([code for code in current_codes if code in seen] +
+                                   [code for code in state["seen_codes"] if code not in current_codes])[:1000]
+            save_exchange_announcements_state(source, state)
+            await asyncio.sleep(EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            failures += 1
+            wait_for = min(300, EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS * (2 ** min(failures, 4)))
+            logger.error(f"[{source.upper()} ERROR] {e}; повтор через {wait_for} сек")
             await asyncio.sleep(wait_for)
 
 # ====== BROWSER SHARE RELAY ======
@@ -1518,6 +1733,9 @@ async def create_backup_archive() -> str | None:
                         BINANCE_ANNOUNCEMENTS_STATE_FILE,
                         arcname=BINANCE_ANNOUNCEMENTS_STATE_FILE,
                     )
+                for state_file in EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values():
+                    if os.path.exists(state_file):
+                        zf.write(state_file, arcname=state_file)
 
         return archive_path
     except Exception as e:
@@ -1615,6 +1833,9 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
                     zf.extract(BOT_SETTINGS_FILE, path='.')
                 if BINANCE_ANNOUNCEMENTS_STATE_FILE in names:
                     zf.extract(BINANCE_ANNOUNCEMENTS_STATE_FILE, path='.')
+                for state_file in EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values():
+                    if state_file in names:
+                        zf.extract(state_file, path='.')
 
         DB.init()
         await update.message.reply_text(
@@ -1765,7 +1986,7 @@ async def show_bot_menu(query):
             callback_data="bot_presence_toggle"
         )],
         [InlineKeyboardButton("🕘 ИЗМЕНИТЬ ВРЕМЯ ONLINE", callback_data="bot_presence_time")],
-        [InlineKeyboardButton("🟨 BINANCE ANNOUNCEMENTS", callback_data="bot_binance_settings")],
+        [InlineKeyboardButton("📰 АНОНСЫ БИРЖ", callback_data="bot_binance_settings")],
         [InlineKeyboardButton("🌐 КНОПКА В БРАУЗЕРЕ", callback_data="bot_browser_share_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
     ]
@@ -1811,6 +2032,7 @@ async def show_browser_share_menu(query):
 async def show_binance_announcements_menu(query):
     settings = load_bot_settings()
     enabled = settings.get("binance_announcements_enabled", False)
+    dividends_enabled = settings.get("exchange_dividends_enabled", False)
     keywords = settings.get("binance_announcements_keywords", [])
     target_chat_id = settings.get("binance_announcements_target_chat_id")
     target_topic_id = settings.get("binance_announcements_target_topic_id")
@@ -1822,17 +2044,23 @@ async def show_binance_announcements_menu(query):
         "не задан"
     )
     text = (
-        "🟨 <b>Binance Announcements</b>\n\n"
-        f"Монитор: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
-        f"Ключевые слова: {keywords_text}\n"
+        "📰 <b>Анонсы бирж</b>\n\n"
+        f"Binance: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
+        f"Ключевые слова Binance: {keywords_text}\n"
+        f"Bitget + Gate (дивиденды): {'✅ ВКЛ' if dividends_enabled else '⛔ ВЫКЛ'}\n"
         f"Куда отправлять: {target_text}\n"
-        f"Интервал проверки: {BINANCE_ANNOUNCEMENTS_POLL_SECONDS} сек.\n\n"
-        "Поиск вручную: <code>/announcements HYPE, delist</code>"
+        f"Интервал: Binance {BINANCE_ANNOUNCEMENTS_POLL_SECONDS} сек., "
+        f"Bitget/Gate {EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS} сек.\n\n"
+        "Поиск по трем биржам: <code>/announcements дивиденды</code>"
     )
     keyboard = [
         [InlineKeyboardButton(
             "⛔ ВЫКЛЮЧИТЬ МОНИТОР" if enabled else "✅ ВКЛЮЧИТЬ МОНИТОР",
             callback_data="bot_binance_toggle",
+        )],
+        [InlineKeyboardButton(
+            "⛔ ВЫКЛЮЧИТЬ BITGET/GATE" if dividends_enabled else "✅ ВКЛЮЧИТЬ BITGET/GATE",
+            callback_data="bot_exchange_dividends_toggle",
         )],
         [InlineKeyboardButton("🔎 ИЗМЕНИТЬ КЛЮЧИ", callback_data="bot_binance_keywords")],
         [InlineKeyboardButton("🎯 ИЗМЕНИТЬ ЧАТ / ТОПИК", callback_data="bot_binance_target")],
@@ -2023,6 +2251,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             request_binance_announcements_reseed()
 
         settings["binance_announcements_enabled"] = not currently_enabled
+        save_bot_settings(settings)
+        await show_binance_announcements_menu(query)
+
+    elif data == "bot_exchange_dividends_toggle":
+        settings = load_bot_settings()
+        if not settings["exchange_dividends_enabled"]:
+            if settings["binance_announcements_target_chat_id"] is None or settings["binance_announcements_target_topic_id"] is None:
+                await query.message.reply_text("❌ Сначала настройте целевой чат и топик.")
+                await show_binance_announcements_menu(query)
+                return
+            for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES:
+                state = load_exchange_announcements_state(source)
+                state["reseed_required"] = True
+                save_exchange_announcements_state(source, state)
+        settings["exchange_dividends_enabled"] = not settings["exchange_dividends_enabled"]
         save_bot_settings(settings)
         await show_binance_announcements_menu(query)
 
@@ -2809,6 +3052,10 @@ async def main():
     await client.start()
     presence_task = asyncio.create_task(presence_emulation_loop())
     binance_announcements_task = asyncio.create_task(binance_announcements_loop())
+    exchange_announcements_tasks = [
+        asyncio.create_task(exchange_dividends_loop(source))
+        for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES
+    ]
     start_browser_share_relay(asyncio.get_running_loop())
     logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
@@ -2820,9 +3067,12 @@ async def main():
         await stop_browser_share_relay()
         presence_task.cancel()
         binance_announcements_task.cancel()
+        for task in exchange_announcements_tasks:
+            task.cancel()
         await asyncio.gather(
             presence_task,
             binance_announcements_task,
+            *exchange_announcements_tasks,
             return_exceptions=True,
         )
         try:
@@ -2842,39 +3092,66 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not keywords:
         await update.message.reply_text(
             "Укажите ключи через запятую:\n"
-            "/announcements HYPE, delist"
+            "/announcements дивиденды"
         )
         return
 
-    await update.message.reply_text("⏳ Запрашиваю последние анонсы Binance...")
-    try:
-        articles = await fetch_binance_announcements()
-    except Exception as e:
-        logger.error(f"[BINANCE SEARCH ERROR] {e}")
-        await update.message.reply_text("❌ Binance API сейчас недоступен. Попробуйте позже.")
+    await update.message.reply_text("⏳ Запрашиваю последние анонсы Binance, Bitget и Gate...")
+    sources = ("Binance", "Bitget", "Gate")
+    results = await asyncio.gather(
+        fetch_binance_announcements(),
+        fetch_exchange_announcements("Bitget"),
+        fetch_exchange_announcements("Gate"),
+        return_exceptions=True,
+    )
+    expanded_keywords = expand_announcement_keywords(keywords)
+    matches = []
+    failed_sources = []
+    for source, result in zip(sources, results):
+        if isinstance(result, BaseException):
+            logger.error(f"[{source.upper()} SEARCH ERROR] {result}")
+            failed_sources.append(source)
+            continue
+        if source == "Binance":
+            found = await search_binance_announcements(result, expanded_keywords, limit=50)
+            matches.extend({
+                **article,
+                "source": "Binance",
+                "url": binance_announcement_url(article["code"]),
+            } for article in found)
+        else:
+            matches.extend(
+                article for article in result
+                if exchange_announcement_matches(article, expanded_keywords)
+            )
+    matches.sort(key=lambda article: article["release_date"], reverse=True)
+    matches = matches[:10]
+    if len(failed_sources) == len(sources):
+        await update.message.reply_text("❌ API всех бирж сейчас недоступны. Попробуйте позже.")
         return
-
-    matches = await search_binance_announcements(articles, keywords, limit=10)
     if not matches:
         await update.message.reply_text(
             "Совпадений среди последних анонсов не найдено. "
-            "Поиск выполнен по заголовку, категории и тексту."
+            "Bitget/Gate: заголовок и краткое описание; Binance: также текст."
+            + (" Недоступны: " + ", ".join(failed_sources) + "." if failed_sources else "")
         )
         return
 
     lines = [
-        "🟨 <b>Последние Binance Announcements</b>",
+        "📰 <b>Последние анонсы</b>",
         "Ключи: " + ", ".join(f"<code>{escape(keyword)}</code>" for keyword in keywords),
         "",
     ]
     for index, article in enumerate(matches, 1):
-        url = escape(binance_announcement_url(article["code"]), quote=True)
-        title = escape(article["title"])
+        url = escape(article["url"], quote=True)
+        title = escape(article["title"][:180])
         category = escape(article.get("category") or "Без категории")
         date_text = format_binance_announcement_date(article["release_date"])
-        lines.append(f'{index}. <a href="{url}">{title}</a>')
+        lines.append(f'{index}. <b>{article["source"]}</b>: <a href="{url}">{title}</a>')
         lines.append(f"{category} · {date_text}")
         lines.append("")
+    if failed_sources:
+        lines.append("Недоступны: " + ", ".join(failed_sources))
 
     await update.message.reply_text(
         "\n".join(lines),
