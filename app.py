@@ -100,6 +100,8 @@ BINANCE_ANNOUNCEMENTS_DETAIL_URL = (
     "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
 )
 BITGET_ANNOUNCEMENTS_URL = "https://api.bitget.com/api/v2/public/annoucements"
+BITGET_SEARCH_MAX_PAGES = 100
+BITGET_SEARCH_MAX_SECONDS = 45
 GATE_ANNOUNCEMENTS_URL = "https://api.gateio.ws/api/v4/ann/list_article"
 EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS = max(
     30, int(os.getenv("EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS", "60"))
@@ -725,27 +727,35 @@ def parse_gate_announcements(payload: dict) -> list[dict]:
             })
     return articles
 
+async def fetch_bitget_announcement_page(cursor: str | None = None) -> tuple[list[dict], str | None, bool]:
+    params = {"language": "en_US", "limit": 10}
+    if cursor:
+        params["cursor"] = cursor
+    url = f"{BITGET_ANNOUNCEMENTS_URL}?{urllib.parse.urlencode(params)}"
+    payload = await asyncio.to_thread(_exchange_http_json_sync, url)
+    articles = parse_bitget_announcements(payload)
+    raw_items = payload["data"]
+    last_item = raw_items[-1] if raw_items else None
+    next_cursor = str(last_item.get("annId") or "") if isinstance(last_item, dict) else ""
+    return articles, next_cursor or None, len(raw_items) == 10
+
 async def fetch_exchange_announcements(source: str) -> list[dict]:
     if source == "Bitget":
         articles = []
         seen_codes = set()
+        seen_cursors = set()
         cursor = None
         for _ in range(5):
-            params = {"language": "en_US", "limit": 10}
-            if cursor:
-                params["cursor"] = cursor
-            url = f"{BITGET_ANNOUNCEMENTS_URL}?{urllib.parse.urlencode(params)}"
-            page = parse_bitget_announcements(
-                await asyncio.to_thread(_exchange_http_json_sync, url)
-            )
+            page, next_cursor, has_more = await fetch_bitget_announcement_page(cursor)
             new_articles = [article for article in page if article["code"] not in seen_codes]
             if not new_articles:
                 break
             articles.extend(new_articles)
             seen_codes.update(article["code"] for article in new_articles)
-            if len(page) < 10:
+            if not has_more or not next_cursor or next_cursor in seen_cursors:
                 break
-            cursor = page[-1]["code"]
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
         return articles
     if source == "Gate":
         payload = await asyncio.to_thread(
@@ -755,14 +765,39 @@ async def fetch_exchange_announcements(source: str) -> list[dict]:
         return parse_gate_announcements(payload)
     raise ValueError(f"Неизвестный источник: {source}")
 
+async def search_bitget_announcements(keywords: list[str], limit: int = 10) -> tuple[list[dict], bool]:
+    matches = []
+    seen_codes = set()
+    seen_cursors = set()
+    cursor = None
+    started_at = time.monotonic()
+    for _ in range(BITGET_SEARCH_MAX_PAGES):
+        page, next_cursor, has_more = await fetch_bitget_announcement_page(cursor)
+        for article in page:
+            if article["code"] not in seen_codes:
+                seen_codes.add(article["code"])
+                if exchange_announcement_matches(article, keywords):
+                    matches.append(article)
+        if len(matches) >= limit or not has_more:
+            return matches[:limit], True
+        if not next_cursor or next_cursor in seen_cursors:
+            return matches, False
+        if time.monotonic() - started_at >= BITGET_SEARCH_MAX_SECONDS:
+            return matches, False
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return matches, False
+
 def exchange_announcement_matches(article: dict, keywords: list[str]) -> list[str]:
     haystack = "\n".join(str(article.get(key) or "") for key in ("title", "category", "summary")).casefold()
     return [keyword for keyword in keywords if keyword.casefold() in haystack]
 
 def expand_announcement_keywords(keywords: list[str]) -> list[str]:
     expanded = list(keywords)
-    if any("дивиденд" in keyword.casefold() for keyword in keywords):
+    if any("дивиденд" in keyword.casefold() or keyword.casefold() == "dividends" for keyword in keywords):
         expanded.append("dividend")
+    if any(keyword.casefold() in {"splits", "сплит", "сплиты"} for keyword in keywords):
+        expanded.append("split")
     return expanded
 
 def load_exchange_announcements_state(source: str) -> dict:
@@ -3120,17 +3155,18 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("⏳ Запрашиваю последние анонсы Binance, Bitget и Gate...")
+    await update.message.reply_text("⏳ Ищу анонсы Binance, Bitget и Gate. Поиск Bitget может занять до минуты...")
     sources = ("Binance", "Bitget", "Gate")
+    expanded_keywords = expand_announcement_keywords(keywords)
     results = await asyncio.gather(
         fetch_binance_announcements(),
-        fetch_exchange_announcements("Bitget"),
+        search_bitget_announcements(expanded_keywords),
         fetch_exchange_announcements("Gate"),
         return_exceptions=True,
     )
-    expanded_keywords = expand_announcement_keywords(keywords)
     matches = []
     failed_sources = []
+    bitget_search_complete = True
     for source, result in zip(sources, results):
         if isinstance(result, BaseException):
             logger.error(f"[{source.upper()} SEARCH ERROR] {result}")
@@ -3143,6 +3179,9 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "source": "Binance",
                 "url": binance_announcement_url(article["code"]),
             } for article in found)
+        elif source == "Bitget":
+            found, bitget_search_complete = result
+            matches.extend(found)
         else:
             matches.extend(
                 article for article in result
@@ -3155,8 +3194,9 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not matches:
         await update.message.reply_text(
-            "Совпадений среди последних анонсов не найдено. "
+            "Совпадений среди просмотренных анонсов не найдено. "
             "Bitget/Gate: заголовок и краткое описание; Binance: также текст."
+            + (" Поиск Bitget ограничен по времени/глубине и не охватил всю доступную ленту." if not bitget_search_complete else "")
             + (" Недоступны: " + ", ".join(failed_sources) + "." if failed_sources else "")
         )
         return
@@ -3176,6 +3216,8 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("")
     if failed_sources:
         lines.append("Недоступны: " + ", ".join(failed_sources))
+    if not bitget_search_complete:
+        lines.append("Bitget: поиск остановлен по лимиту времени/глубины; возможны более старые совпадения.")
 
     await update.message.reply_text(
         "\n".join(lines),
