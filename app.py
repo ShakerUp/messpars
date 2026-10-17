@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 from html import escape, unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ from telethon.tl.types import (
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from stock_calendar import build_snapshot, load_state as load_stock_calendar_state, save_state as save_stock_calendar_state, due_reminders, STATE_FILE as STOCK_CALENDAR_STATE_FILE
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
 logging.basicConfig(
@@ -130,6 +132,9 @@ DEFAULT_BOT_SETTINGS = {
     "binance_announcements_target_topic_id": None,
     "browser_share_target_chat_id": None,
     "browser_share_target_topic_id": None,
+    "stock_calendar_enabled": False,
+    "stock_calendar_target_chat_id": None,
+    "stock_calendar_target_topic_id": None,
 }
 
 # ====== БЛОКИРОВКА ДЛЯ ЗАПИСИ В КОНФИГ/БД ПРИ RESTORE ======
@@ -184,6 +189,7 @@ def load_bot_settings() -> dict:
         settings.get("binance_announcements_enabled")
     )
     settings["exchange_dividends_enabled"] = bool(settings.get("exchange_dividends_enabled"))
+    settings["stock_calendar_enabled"] = bool(settings.get("stock_calendar_enabled"))
     settings["announcements_enabled"] = (
         bool(settings.get("announcements_enabled"))
         if "announcements_enabled" in saved else
@@ -199,6 +205,8 @@ def load_bot_settings() -> dict:
         "binance_announcements_target_topic_id",
         "browser_share_target_chat_id",
         "browser_share_target_topic_id",
+        "stock_calendar_target_chat_id",
+        "stock_calendar_target_topic_id",
     ):
         try:
             settings[key] = int(settings[key]) if settings.get(key) is not None else None
@@ -1828,6 +1836,8 @@ async def create_backup_archive() -> str | None:
                 for state_file in EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values():
                     if os.path.exists(state_file):
                         zf.write(state_file, arcname=state_file)
+                if os.path.exists(STOCK_CALENDAR_STATE_FILE):
+                    zf.write(STOCK_CALENDAR_STATE_FILE, arcname=STOCK_CALENDAR_STATE_FILE)
 
         return archive_path
     except Exception as e:
@@ -1928,6 +1938,8 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
                 for state_file in EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values():
                     if state_file in names:
                         zf.extract(state_file, path='.')
+                if STOCK_CALENDAR_STATE_FILE in names:
+                    zf.extract(STOCK_CALENDAR_STATE_FILE, path='.')
 
         DB.init()
         await update.message.reply_text(
@@ -2059,6 +2071,208 @@ async def show_manage_menu(query, cid, db):
         parse_mode='Markdown'
     )
 
+STOCK_CALENDAR_REFRESH_SECONDS = 8 * 60 * 60
+stock_calendar_refresh_requested = False
+
+
+def stock_calendar_lines(snapshot):
+    checked = snapshot.get("checked_at", "")[:16].replace("T", " ")
+    lines = [
+        f"📅 <b>Дивиденды акций США / USDT-фьючерсы до {snapshot.get('calendar_end', '?')}</b>",
+        f"Проверено: {escape(checked)} UTC | Nasdaq | цены: Nasdaq last sale",
+        "Процент = выплата за событие / последняя цена акции, не годовая доходность.",
+        "Фьючерс не даёт права на дивиденд акции.\n",
+    ]
+    if snapshot.get("errors"):
+        lines.append("⚠️ Не проверены: " + ", ".join(escape(name) for name in snapshot["errors"]))
+    for event in snapshot.get("events", []):
+        amount = event["amount"]
+        price = event.get("price")
+        yield_pct = event.get("event_yield_pct")
+        rate = f"{yield_pct:.3f}% от ${price:g}" if yield_pct is not None else "% недоступен (нет цены)"
+        lines.append(
+            f"<b>{escape(event['ex_date'])} {escape(event['symbol'])}</b> "
+            f"${amount:g} · {rate} · {escape(', '.join(event['exchanges']))}"
+        )
+    if not snapshot.get("events"):
+        lines.append("Подтверждённых будущих дивидендов по найденным тикерам пока нет.")
+    lines.append("Даты и суммы могут измениться; неанонсированные выплаты не показаны.")
+    return lines
+
+
+def stock_calendar_pages(snapshot):
+    pages, current = [], []
+    for line in stock_calendar_lines(snapshot):
+        if current and len("\n".join(current + [line])) > 3500:
+            pages.append("\n".join(current))
+            current = ["📅 <b>Дивиденды акций (продолжение)</b>", line]
+        else:
+            current.append(line)
+    pages.append("\n".join(current))
+    return pages
+
+
+async def publish_stock_calendar(settings, state):
+    chat_id = settings.get("stock_calendar_target_chat_id")
+    if chat_id is None:
+        return
+    topic_id = settings.get("stock_calendar_target_topic_id")
+    pages = stock_calendar_pages(state["snapshot"])
+    old_ids = state.get("message_ids", [])
+    new_ids = []
+    for index, page in enumerate(pages):
+        message_id = old_ids[index] if index < len(old_ids) else None
+        if message_id:
+            try:
+                await bot_app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id, text=page, parse_mode="HTML")
+                new_ids.append(message_id)
+                state["message_ids"] = new_ids + old_ids[len(new_ids):]
+                save_stock_calendar_state(state)
+                continue
+            except Exception as exc:
+                error_text = str(exc).lower()
+                if "message is not modified" in error_text:
+                    new_ids.append(message_id)
+                    continue
+                if not any(text in error_text for text in ("message to edit not found", "message can't be edited")):
+                    raise
+        msg = await bot_app.bot.send_message(
+            chat_id=chat_id, message_thread_id=topic_id, text=page,
+            parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+        new_ids.append(msg.message_id)
+        state["message_ids"] = new_ids + old_ids[len(new_ids):]
+        save_stock_calendar_state(state)
+    for message_id in old_ids[len(pages):]:
+        try:
+            await bot_app.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as exc:
+            logger.warning("[STOCK CALENDAR] Не удалось удалить старую страницу: %s", exc)
+    state["message_ids"] = new_ids
+    state["published_chat_id"] = chat_id
+    state["published_topic_id"] = topic_id
+    save_stock_calendar_state(state)
+
+
+async def stock_calendar_loop():
+    global stock_calendar_refresh_requested
+    while True:
+        try:
+            settings = load_bot_settings()
+            if settings.get("stock_calendar_enabled") and settings.get("stock_calendar_target_chat_id") is not None:
+                state = load_stock_calendar_state()
+                last = state.get("snapshot", {}).get("checked_at")
+                try:
+                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() if last else float("inf")
+                except (ValueError, TypeError):
+                    age = float("inf")
+                last_attempt = state.get("last_attempt_at")
+                try:
+                    since_attempt = (datetime.now(timezone.utc) - datetime.fromisoformat(last_attempt)).total_seconds() if last_attempt else float("inf")
+                except (ValueError, TypeError):
+                    since_attempt = float("inf")
+                refreshed = False
+                if stock_calendar_refresh_requested or (age >= STOCK_CALENDAR_REFRESH_SECONDS and since_attempt >= 3600):
+                    stock_calendar_refresh_requested = False
+                    try:
+                        snapshot = await asyncio.to_thread(build_snapshot)
+                        state["snapshot"] = snapshot
+                        state.pop("last_error", None)
+                        state["needs_publish"] = True
+                        state["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                        save_stock_calendar_state(state)
+                        age = 0
+                        refreshed = True
+                        logger.info("[STOCK CALENDAR] %s тикеров, %s событий, ошибки: %s",
+                                    len(snapshot["symbols"]), len(snapshot["events"]), snapshot["errors"])
+                    except Exception as exc:
+                        state["last_error"] = str(exc)[:300]
+                        state["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                        save_stock_calendar_state(state)
+                        logger.exception("[STOCK CALENDAR] Обновление не удалось")
+                snapshot = state.get("snapshot")
+                if snapshot and age < 12 * 60 * 60:
+                    target_changed = (state.get("published_chat_id") != settings["stock_calendar_target_chat_id"]
+                                      or state.get("published_topic_id") != settings["stock_calendar_target_topic_id"])
+                    if target_changed:
+                        old_chat_id = state.get("published_chat_id")
+                        if old_chat_id:
+                            for message_id in state.get("message_ids", []):
+                                try:
+                                    await bot_app.bot.delete_message(chat_id=old_chat_id, message_id=message_id)
+                                except Exception as exc:
+                                    logger.warning("[STOCK CALENDAR] Старую страницу удалить не удалось: %s", exc)
+                        state["message_ids"] = []
+                        state["published_chat_id"] = settings["stock_calendar_target_chat_id"]
+                        state["published_topic_id"] = settings["stock_calendar_target_topic_id"]
+                        state["needs_publish"] = True
+                        save_stock_calendar_state(state)
+                    if refreshed or target_changed or state.get("needs_publish") or not state.get("message_ids"):
+                        try:
+                            await publish_stock_calendar(settings, state)
+                            state.pop("delivery_error", None)
+                            state["needs_publish"] = False
+                            save_stock_calendar_state(state)
+                        except Exception as exc:
+                            state["delivery_error"] = str(exc)[:200]
+                            save_stock_calendar_state(state)
+                            raise
+                    today = datetime.now(ZoneInfo("Europe/Kyiv")).date()
+                    sent = set(state.get("sent_reminders", []))
+                    for event in due_reminders(snapshot, sent, today) if not state.get("last_error") else []:
+                        key = f"{event['symbol']}:{event['ex_date']}"
+                        rate = event.get("event_yield_pct")
+                        rate_text = f"{rate:.3f}% от цены акции" if rate is not None else "% недоступен"
+                        text = (f"⏰ <b>Через 3 дня ex-dividend: {escape(event['symbol'])}</b>\n"
+                                f"Дата: {escape(event['ex_date'])}\n"
+                                f"Выплата: ${event['amount']:g} на акцию · {rate_text}\n"
+                                f"USDT-фьючерсы: {escape(', '.join(event['exchanges']))}\n"
+                                "Источник: Nasdaq. Фьючерс не даёт права на дивиденд.")
+                        await bot_app.bot.send_message(
+                            chat_id=settings["stock_calendar_target_chat_id"],
+                            message_thread_id=settings["stock_calendar_target_topic_id"],
+                            text=text, parse_mode="HTML")
+                        sent.add(key)
+                        state["sent_reminders"] = sorted(sent)
+                        save_stock_calendar_state(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[STOCK CALENDAR] Ошибка фонового цикла")
+        await asyncio.sleep(60)
+
+
+async def show_stock_calendar_menu(query):
+    settings = load_bot_settings()
+    state = load_stock_calendar_state()
+    snapshot = state.get("snapshot", {})
+    target = settings.get("stock_calendar_target_chat_id")
+    topic = settings.get("stock_calendar_target_topic_id")
+    target_text = f"<code>{target}</code>" + (f" / topic <code>{topic}</code>" if topic else "") if target else "не задан"
+    coverage = ", ".join(f"{name}: {sum(name in v for v in snapshot.get('symbols', {}).values())}"
+                         for name in ("Binance", "Bitget", "Gate", "OKX", "Bybit"))
+    text = (
+        "📅 <b>Дивидендный календарь акций США</b>\n\n"
+        f"Монитор: {'✅ ВКЛ' if settings['stock_calendar_enabled'] else '⛔ ВЫКЛ'}\n"
+        f"Чат: {target_text}\n"
+        f"Тикеров: {len(snapshot.get('symbols', {}))}, событий: {len(snapshot.get('events', []))}\n"
+        f"Биржи: {escape(coverage)}\n"
+        f"Последняя проверка: {escape(snapshot.get('checked_at', 'ещё не было')[:19])}\n"
+        f"Ошибка: {escape(state.get('last_error', 'нет'))}\n\n"
+        f"Отправка: {escape(state.get('delivery_error', 'норма'))}\n\n"
+        "Источник: Nasdaq; обновление каждые 8 часов. Напоминание за 3 дня. "
+        "Только опубликованные даты и американские акции. Фьючерсы не дают права на дивиденды."
+    )
+    keyboard = [
+        [InlineKeyboardButton("⛔ ВЫКЛЮЧИТЬ" if settings["stock_calendar_enabled"] else "✅ ВКЛЮЧИТЬ",
+                              callback_data="stock_calendar_toggle")],
+        [InlineKeyboardButton("🎯 ЧАТ / ТОПИК", callback_data="stock_calendar_target")],
+        [InlineKeyboardButton("🔄 ОБНОВИТЬ", callback_data="stock_calendar_refresh")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="bot_settings")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+
 async def show_bot_menu(query):
     settings = load_bot_settings()
     presence_enabled = settings.get("presence_enabled", True)
@@ -2079,6 +2293,7 @@ async def show_bot_menu(query):
         )],
         [InlineKeyboardButton("🕘 ИЗМЕНИТЬ ВРЕМЯ ONLINE", callback_data="bot_presence_time")],
         [InlineKeyboardButton("📰 АНОНСЫ БИРЖ", callback_data="bot_binance_settings")],
+        [InlineKeyboardButton("📅 ДИВИДЕНДНЫЙ КАЛЕНДАРЬ", callback_data="stock_calendar_settings")],
         [InlineKeyboardButton("🌐 КНОПКА В БРАУЗЕРЕ", callback_data="bot_browser_share_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
     ]
@@ -2302,6 +2517,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "bot_settings":
         await show_bot_menu(query)
 
+    elif data == "stock_calendar_settings":
+        await show_stock_calendar_menu(query)
+
+    elif data == "stock_calendar_target":
+        user_edit_state[query.from_user.id] = {"mode": "stock_calendar_target"}
+        await query.message.reply_text(
+            "Введите ID чата и, если нужен, ID топика через пробел.\n"
+            "Пример: <code>-1001234567890 777</code> или <code>-1001234567890</code>",
+            parse_mode="HTML")
+
+    elif data == "stock_calendar_toggle":
+        settings = load_bot_settings()
+        if not settings["stock_calendar_enabled"] and settings["stock_calendar_target_chat_id"] is None:
+            await query.message.reply_text("Сначала задайте чат/топик для календаря.")
+        else:
+            settings["stock_calendar_enabled"] = not settings["stock_calendar_enabled"]
+            save_bot_settings(settings)
+            global stock_calendar_refresh_requested
+            stock_calendar_refresh_requested = True
+        await show_stock_calendar_menu(query)
+
+    elif data == "stock_calendar_refresh":
+        stock_calendar_refresh_requested = True
+        await query.message.reply_text("Обновление запрошено. Результат появится после проверки источников.")
+        await show_stock_calendar_menu(query)
+
     elif data == "bot_browser_share_settings":
         await show_browser_share_menu(query)
 
@@ -2518,6 +2759,18 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_bot_settings(settings)
         topic_text = f", топик `{target_topic_id}`" if target_topic_id else " без топика"
         text = f"✅ Ссылки из браузера будут отправляться в чат `{target_chat_id}`{topic_text}."
+
+    elif state["mode"] == "stock_calendar_target":
+        parsed_target = parse_optional_chat_topic_target(new_input)
+        if not parsed_target:
+            await update.message.reply_text("Некорректный ID чата или топика. Пример: -1001234567890 777")
+            return
+        target_chat_id, target_topic_id = parsed_target
+        settings = load_bot_settings()
+        settings["stock_calendar_target_chat_id"] = target_chat_id
+        settings["stock_calendar_target_topic_id"] = target_topic_id
+        save_bot_settings(settings)
+        text = f"✅ Календарь направлен в чат `{target_chat_id}`" + (f", топик `{target_topic_id}`." if target_topic_id else ".")
 
     elif state["mode"] == "binance_keywords":
         settings = load_bot_settings()
@@ -3104,6 +3357,7 @@ async def main():
     bot_app.add_handler(CommandHandler("restore", cmd_restore))
     bot_app.add_handler(CommandHandler("announcements", cmd_announcements))
     bot_app.add_handler(CommandHandler("ann", cmd_announcements))
+    bot_app.add_handler(CommandHandler("divcalendar", cmd_divcalendar))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_document))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text))
@@ -3136,6 +3390,7 @@ async def main():
         asyncio.create_task(exchange_announcements_loop(source))
         for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES
     ]
+    stock_calendar_task = asyncio.create_task(stock_calendar_loop())
     start_browser_share_relay(asyncio.get_running_loop())
     logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
@@ -3149,10 +3404,12 @@ async def main():
         binance_announcements_task.cancel()
         for task in exchange_announcements_tasks:
             task.cancel()
+        stock_calendar_task.cancel()
         await asyncio.gather(
             presence_task,
             binance_announcements_task,
             *exchange_announcements_tasks,
+            stock_calendar_task,
             return_exceptions=True,
         )
         try:
@@ -3160,6 +3417,21 @@ async def main():
             logger.info("[PRESENCE] Аккаунт переведен в offline перед остановкой")
         except Exception as e:
             logger.warning(f"[PRESENCE] Не удалось перевести аккаунт в offline при остановке: {e}")
+
+async def cmd_divcalendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    state = load_stock_calendar_state()
+    snapshot = state.get("snapshot")
+    if not snapshot:
+        await update.message.reply_text(
+            "Календарь ещё не загружен. Откройте /list → Бот → Дивидендный календарь, "
+            "задайте чат и включите монитор. Ошибка: " + state.get("last_error", "нет"))
+        return
+    for page in stock_calendar_pages(snapshot):
+        await update.message.reply_text(page, parse_mode="HTML",
+                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
+
 
 async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
