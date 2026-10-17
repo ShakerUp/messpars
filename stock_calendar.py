@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 STATE_FILE = "stock_calendar_state.json"
@@ -20,8 +21,31 @@ NASDAQ_HEADERS = {
     "Origin": "https://www.nasdaq.com",
     "Accept-Language": "en-US,en;q=0.5",
 }
-EXCHANGES = ("Binance", "Bitget", "Gate", "OKX", "Bybit")
+EXCHANGES = ("Binance", "Bitget", "Gate", "OKX", "Bybit", "MEXC")
 TICKER = re.compile(r"^[A-Z][A-Z0-9.\-]{0,11}$")
+RUSSIAN_MONTHS = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def format_russian_date(value):
+    raw = str(value or "")
+    if "T" in raw:
+        try:
+            checked_at = datetime.fromisoformat(raw)
+            if checked_at.tzinfo is not None:
+                try:
+                    kyiv_zone = ZoneInfo("Europe/Kyiv")
+                except ZoneInfoNotFoundError:
+                    kyiv_zone = checked_at.astimezone().tzinfo
+                raw = checked_at.astimezone(kyiv_zone).date().isoformat()
+        except ValueError:
+            pass
+    parsed = parse_date(raw[:10])
+    if parsed is None:
+        return "нет данных"
+    return f"{parsed.day} {RUSSIAN_MONTHS[parsed.month - 1]} {parsed.year}"
 
 
 def fetch_json(url, headers=None):
@@ -139,6 +163,21 @@ def discover_bybit(get=get_json):
     raise ValueError("Bybit instrument pagination exceeded")
 
 
+def discover_mexc(get=get_json):
+    payload = get("https://api.mexc.com/api/v1/contract/detail/country")
+    if payload.get("code") != 0 or not isinstance(payload.get("data"), list):
+        raise ValueError("MEXC contract response failed")
+    result = {}
+    for item in payload["data"]:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("typeLabel") == 2 and item.get("state") == 0
+                and item.get("futureType") == 1 and item.get("quoteCoin") == "USDT"
+                and item.get("settleCoin") == "USDT"):
+            add_symbol(result, "MEXC", item.get("baseCoinName"))
+    return result
+
+
 def discover_all(get=get_json):
     result = {}
     errors = {}
@@ -148,6 +187,7 @@ def discover_all(get=get_json):
         ("Gate", lambda: discover_gate(get)),
         ("OKX", lambda: discover_okx(get)),
         ("Bybit", lambda: discover_bybit(get)),
+        ("MEXC", lambda: discover_mexc(get)),
     ):
         try:
             found = discover()

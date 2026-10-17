@@ -1,11 +1,18 @@
 import unittest
-from datetime import date
+from datetime import date, timezone, timedelta
 from unittest.mock import patch
 
 import stock_calendar as calendar
 
 
 class StockCalendarTests(unittest.TestCase):
+    def test_russian_dates_and_kyiv_check_date(self):
+        self.assertEqual(calendar.format_russian_date("2026-10-30"), "30 октября 2026")
+        with patch.object(calendar, "ZoneInfo", return_value=timezone(timedelta(hours=3))):
+            self.assertEqual(calendar.format_russian_date("2026-10-17T22:30:00+00:00"),
+                             "18 октября 2026")
+        self.assertEqual(calendar.format_russian_date(None), "нет данных")
+
     def test_binance_only_explicit_equity_usdt_perpetuals(self):
         payload = {"symbols": [
             {"status": "TRADING", "quoteAsset": "USDT", "contractType": "TRADIFI_PERPETUAL",
@@ -52,6 +59,26 @@ class StockCalendarTests(unittest.TestCase):
         self.assertEqual(calendar.discover_bybit(get),
                          {"AAPL": {"Bybit"}, "MSFT": {"Bybit"}})
         self.assertEqual(calls[1]["cursor"], "next")
+
+    def test_mexc_uses_stock_ticker_not_contract_name(self):
+        payload = {"code": 0, "data": [
+            {"typeLabel": 2, "state": 0, "futureType": 1,
+             "quoteCoin": "USDT", "settleCoin": "USDT",
+             "baseCoin": "TESLA", "baseCoinName": "TSLA"},
+            {"typeLabel": 2, "state": 0, "futureType": 1,
+             "quoteCoin": "USDT", "settleCoin": "USDT",
+             "baseCoin": "AAPLSTOCK", "baseCoinName": "AAPL"},
+            {"typeLabel": 0, "state": 0, "futureType": 1,
+             "quoteCoin": "USDT", "settleCoin": "USDT",
+             "baseCoin": "FAKE", "baseCoinName": "FAKE"},
+            {"typeLabel": 2, "state": 4, "futureType": 1,
+             "quoteCoin": "USDT", "settleCoin": "USDT",
+             "baseCoin": "MSFTSTOCK", "baseCoinName": "MSFT"},
+        ]}
+        self.assertEqual(calendar.discover_mexc(lambda *_args, **_kwargs: payload),
+                         {"TSLA": {"MEXC"}, "AAPL": {"MEXC"}})
+        with self.assertRaises(ValueError):
+            calendar.discover_mexc(lambda *_args, **_kwargs: {"code": 600})
 
     def test_nasdaq_schema_failure_is_not_empty_calendar(self):
         with self.assertRaises(ValueError):

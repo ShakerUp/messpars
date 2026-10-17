@@ -32,7 +32,8 @@ from telethon.tl.types import (
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
-from stock_calendar import build_snapshot, load_state as load_stock_calendar_state, save_state as save_stock_calendar_state, due_reminders, STATE_FILE as STOCK_CALENDAR_STATE_FILE
+from stock_calendar import build_snapshot, load_state as load_stock_calendar_state, save_state as save_stock_calendar_state, due_reminders, format_russian_date, STATE_FILE as STOCK_CALENDAR_STATE_FILE
+from mexc_announcements import parse_mexc_announcements
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
 logging.basicConfig(
@@ -66,6 +67,7 @@ BINANCE_ANNOUNCEMENTS_STATE_FILE = 'binance_announcements_state.json'
 EXCHANGE_ANNOUNCEMENTS_STATE_FILES = {
     "Bitget": "bitget_announcements_state.json",
     "Gate": "gate_announcements_state.json",
+    "MEXC": "mexc_announcements_state.json",
 }
 DB_FILE = 'bot_data.db'
 MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -105,6 +107,7 @@ BITGET_ANNOUNCEMENTS_URL = "https://api.bitget.com/api/v2/public/annoucements"
 BITGET_SEARCH_MAX_PAGES = 100
 BITGET_SEARCH_MAX_SECONDS = 45
 GATE_ANNOUNCEMENTS_URL = "https://api.gateio.ws/api/v4/ann/list_article"
+MEXC_ANNOUNCEMENTS_URL = "https://api.mexc.com/api/v3/announcements"
 EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS = max(
     30, int(os.getenv("EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS", "60"))
 )
@@ -779,7 +782,31 @@ async def fetch_exchange_announcements(source: str) -> list[dict]:
             {"page": "1", "size": "50", "lang": "en", "pinned": 0},
         )
         return parse_gate_announcements(payload)
+    if source == "MEXC":
+        articles, _ = await fetch_mexc_announcement_page(1)
+        return articles
     raise ValueError(f"Неизвестный источник: {source}")
+
+async def fetch_mexc_announcement_page(page: int) -> tuple[list[dict], int]:
+    url = f"{MEXC_ANNOUNCEMENTS_URL}?{urllib.parse.urlencode({'language': 'en-US', 'page': page, 'limit': 50})}"
+    payload = await asyncio.to_thread(_exchange_http_json_sync, url)
+    return parse_mexc_announcements(payload)
+
+async def search_mexc_announcements(keywords: list[str], limit: int = 10) -> tuple[list[dict], bool]:
+    matches = []
+    seen_codes = set()
+    for page_number in range(1, 11):
+        if page_number > 1:
+            await asyncio.sleep(0.45)
+        articles, total_pages = await fetch_mexc_announcement_page(page_number)
+        for article in articles:
+            if article["code"] not in seen_codes:
+                seen_codes.add(article["code"])
+                if exchange_announcement_matches(article, keywords):
+                    matches.append(article)
+        if len(matches) >= limit or page_number >= total_pages or not articles:
+            return matches[:limit], True
+    return matches, False
 
 async def search_bitget_announcements(keywords: list[str], limit: int = 10) -> tuple[list[dict], bool]:
     matches = []
@@ -2076,27 +2103,23 @@ stock_calendar_refresh_requested = False
 
 
 def stock_calendar_lines(snapshot):
-    checked = snapshot.get("checked_at", "")[:16].replace("T", " ")
+    checked = format_russian_date(snapshot.get("checked_at"))
     lines = [
-        f"📅 <b>Дивиденды акций США / USDT-фьючерсы до {snapshot.get('calendar_end', '?')}</b>",
-        f"Проверено: {escape(checked)} UTC | Nasdaq | цены: Nasdaq last sale",
-        "Процент = выплата за событие / последняя цена акции, не годовая доходность.",
-        "Фьючерс не даёт права на дивиденд акции.\n",
+        "📅 <b>Дивидендный календарь</b>",
+        f"Последняя проверка: {escape(checked)}\n",
     ]
-    if snapshot.get("errors"):
-        lines.append("⚠️ Не проверены: " + ", ".join(escape(name) for name in snapshot["errors"]))
     for event in snapshot.get("events", []):
         amount = event["amount"]
         price = event.get("price")
         yield_pct = event.get("event_yield_pct")
-        rate = f"{yield_pct:.3f}% от ${price:g}" if yield_pct is not None else "% недоступен (нет цены)"
+        rate = f"{yield_pct:.3f}% от ${price:g}" if yield_pct is not None else "% нет"
         lines.append(
-            f"<b>{escape(event['ex_date'])} {escape(event['symbol'])}</b> "
-            f"${amount:g} · {rate} · {escape(', '.join(event['exchanges']))}"
+            f"<b>{escape(format_russian_date(event['ex_date']))} · {escape(event['symbol'])}</b> "
+            f"${amount:g} · {rate}\n"
+            f"Биржи с USDT-фьючерсом на этот тикер: {escape(', '.join(event['exchanges']))}"
         )
     if not snapshot.get("events"):
-        lines.append("Подтверждённых будущих дивидендов по найденным тикерам пока нет.")
-    lines.append("Даты и суммы могут измениться; неанонсированные выплаты не показаны.")
+        lines.append("Пока нет объявленных выплат.")
     return lines
 
 
@@ -2226,7 +2249,7 @@ async def stock_calendar_loop():
                         text = (f"⏰ <b>Через 3 дня ex-dividend: {escape(event['symbol'])}</b>\n"
                                 f"Дата: {escape(event['ex_date'])}\n"
                                 f"Выплата: ${event['amount']:g} на акцию · {rate_text}\n"
-                                f"USDT-фьючерсы: {escape(', '.join(event['exchanges']))}\n"
+                                f"Биржи с USDT-фьючерсом на этот тикер: {escape(', '.join(event['exchanges']))}\n"
                                 "Источник: Nasdaq. Фьючерс не даёт права на дивиденд.")
                         await bot_app.bot.send_message(
                             chat_id=settings["stock_calendar_target_chat_id"],
@@ -2246,23 +2269,12 @@ async def show_stock_calendar_menu(query):
     settings = load_bot_settings()
     state = load_stock_calendar_state()
     snapshot = state.get("snapshot", {})
-    target = settings.get("stock_calendar_target_chat_id")
-    topic = settings.get("stock_calendar_target_topic_id")
-    target_text = f"<code>{target}</code>" + (f" / topic <code>{topic}</code>" if topic else "") if target else "не задан"
-    coverage = ", ".join(f"{name}: {sum(name in v for v in snapshot.get('symbols', {}).values())}"
-                         for name in ("Binance", "Bitget", "Gate", "OKX", "Bybit"))
     text = (
-        "📅 <b>Дивидендный календарь акций США</b>\n\n"
-        f"Монитор: {'✅ ВКЛ' if settings['stock_calendar_enabled'] else '⛔ ВЫКЛ'}\n"
-        f"Чат: {target_text}\n"
-        f"Тикеров: {len(snapshot.get('symbols', {}))}, событий: {len(snapshot.get('events', []))}\n"
-        f"Биржи: {escape(coverage)}\n"
-        f"Последняя проверка: {escape(snapshot.get('checked_at', 'ещё не было')[:19])}\n"
-        f"Ошибка: {escape(state.get('last_error', 'нет'))}\n\n"
-        f"Отправка: {escape(state.get('delivery_error', 'норма'))}\n\n"
-        "Источник: Nasdaq; обновление каждые 8 часов. Напоминание за 3 дня. "
-        "Только опубликованные даты и американские акции. Фьючерсы не дают права на дивиденды."
+        "📅 <b>Дивидендный календарь</b>\n"
+        f"Последняя проверка: {escape(format_russian_date(snapshot.get('checked_at')))}"
     )
+    if state.get("last_error") or state.get("delivery_error"):
+        text += "\n⚠️ Проверка или отправка не удалась. Подробности в логах бота."
     keyboard = [
         [InlineKeyboardButton("⛔ ВЫКЛЮЧИТЬ" if settings["stock_calendar_enabled"] else "✅ ВКЛЮЧИТЬ",
                               callback_data="stock_calendar_toggle")],
@@ -2351,12 +2363,12 @@ async def show_binance_announcements_menu(query):
     )
     text = (
         "📰 <b>Анонсы бирж</b>\n\n"
-        f"Binance, Bitget, Gate: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
+        f"Binance, Bitget, Gate, MEXC: {'✅ ВКЛ' if enabled else '⛔ ВЫКЛ'}\n"
         f"Ключевые слова: {keywords_text}\n"
         f"Куда отправлять: {target_text}\n"
         f"Интервал: Binance {BINANCE_ANNOUNCEMENTS_POLL_SECONDS} сек., "
-        f"Bitget/Gate {EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS} сек.\n\n"
-        "Поиск по трем биржам: <code>/announcements дивиденды</code>"
+        f"Bitget/Gate/MEXC {EXCHANGE_ANNOUNCEMENTS_POLL_SECONDS} сек.\n\n"
+        "Поиск по четырём биржам: <code>/announcements дивиденды</code>"
     )
     keyboard = [
         [InlineKeyboardButton(
@@ -2593,7 +2605,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_edit_state[query.from_user.id] = {"mode": "binance_keywords"}
         await query.message.reply_text(
             "📝 Введите ключевые слова через запятую или каждое с новой строки.\n\n"
-            "Все три биржи проверяют эти ключи; совпадение любого отправит уведомление.\n"
+            "Все четыре биржи проверяют эти ключи; совпадение любого отправит уведомление.\n"
             "Пример: `dividend, split`\n"
             "Чтобы очистить список, отправьте `0`.",
             parse_mode="Markdown",
@@ -3448,18 +3460,20 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("⏳ Ищу анонсы Binance, Bitget и Gate. Поиск Bitget может занять до минуты...")
-    sources = ("Binance", "Bitget", "Gate")
+    await update.message.reply_text("⏳ Ищу анонсы Binance, Bitget, Gate и MEXC. Поиск Bitget может занять до минуты...")
+    sources = ("Binance", "Bitget", "Gate", "MEXC")
     expanded_keywords = expand_announcement_keywords(keywords)
     results = await asyncio.gather(
         fetch_binance_announcements(),
         search_bitget_announcements(expanded_keywords),
         fetch_exchange_announcements("Gate"),
+        search_mexc_announcements(expanded_keywords),
         return_exceptions=True,
     )
     matches = []
     failed_sources = []
     bitget_search_complete = True
+    mexc_search_complete = True
     for source, result in zip(sources, results):
         if isinstance(result, BaseException):
             logger.error(f"[{source.upper()} SEARCH ERROR] {result}")
@@ -3475,6 +3489,9 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif source == "Bitget":
             found, bitget_search_complete = result
             matches.extend(found)
+        elif source == "MEXC":
+            found, mexc_search_complete = result
+            matches.extend(found)
         else:
             matches.extend(
                 article for article in result
@@ -3488,8 +3505,9 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matches:
         await update.message.reply_text(
             "Совпадений среди просмотренных анонсов не найдено. "
-            "Bitget/Gate: заголовок и краткое описание; Binance: также текст."
+            "Bitget/Gate: заголовок и краткое описание; MEXC: заголовок; Binance: также текст."
             + (" Поиск Bitget ограничен по времени/глубине и не охватил всю доступную ленту." if not bitget_search_complete else "")
+            + (" Поиск MEXC ограничен последними 500 анонсами." if not mexc_search_complete else "")
             + (" Недоступны: " + ", ".join(failed_sources) + "." if failed_sources else "")
         )
         return
@@ -3511,6 +3529,8 @@ async def cmd_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Недоступны: " + ", ".join(failed_sources))
     if not bitget_search_complete:
         lines.append("Bitget: поиск остановлен по лимиту времени/глубины; возможны более старые совпадения.")
+    if not mexc_search_complete:
+        lines.append("MEXC: поиск ограничен последними 500 анонсами; возможны более старые совпадения.")
 
     await update.message.reply_text(
         "\n".join(lines),
