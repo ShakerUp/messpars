@@ -1,0 +1,2 @@
+# Browser-compatible HTTP transport for Gate's public announcement pages.
+curl_cffi>=0.7,<0.18

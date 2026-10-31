@@ -445,15 +445,17 @@ def parse_binance_announcement_list(payload: dict) -> list[dict]:
 
     return sorted(result.values(), key=lambda item: item["release_date"], reverse=True)
 
-async def fetch_binance_announcements(page_size: int = BINANCE_ANNOUNCEMENTS_PAGE_SIZE) -> list[dict]:
+async def fetch_binance_announcements(page_size: int = BINANCE_ANNOUNCEMENTS_PAGE_SIZE, page_number: int = 1) -> list[dict]:
     errors = []
-    params = {"type": 1, "pageNo": 1, "pageSize": page_size}
+    params = {"type": 1, "pageNo": page_number, "pageSize": page_size}
     for url in BINANCE_ANNOUNCEMENTS_LIST_URLS:
         try:
             payload = await binance_http_json(url, params)
             articles = parse_binance_announcement_list(payload)
             if articles:
                 return articles
+            if page_number > 1 and isinstance(payload.get("data"), dict):
+                return []
             errors.append(f"{url}: пустой ответ")
         except Exception as e:
             errors.append(f"{url}: {e}")
@@ -2105,6 +2107,25 @@ STOCK_CALENDAR_REFRESH_SECONDS = 8 * 60 * 60
 stock_calendar_refresh_requested = False
 
 
+async def dividend_history_page(source, cursor=None):
+    if source == "Bitget":
+        articles, next_cursor, more = await fetch_bitget_announcement_page(cursor)
+        return articles, next_cursor if more else None
+    page = int(cursor or 1)
+    if source == "Gate":
+        payload = await asyncio.to_thread(_exchange_http_json_sync, GATE_ANNOUNCEMENTS_URL,
+                                         {"title_query": "dividend", "page": str(page), "size": "50", "lang": "en", "pinned": 0})
+        articles = parse_gate_announcements(payload)
+        total = int(payload["data"].get("total") or 0)
+        return articles, page + 1 if articles and page * 50 < total else None
+    if source == "MEXC":
+        articles, total_pages = await fetch_mexc_announcement_page(page)
+        return articles, page + 1 if articles and page < total_pages else None
+    articles = [{**a, "source": "Binance", "url": binance_announcement_url(a["code"])}
+                for a in await fetch_binance_announcements(page_size=50, page_number=page)]
+    return articles, page + 1 if articles else None
+
+
 async def sync_dividend_announcements(force=False):
     state = load_stock_calendar_state(DIVIDEND_ANNOUNCEMENTS_STATE_FILE)
     if not force and time.time() - state.get("checked_at", 0) < 300:
@@ -2113,21 +2134,43 @@ async def sync_dividend_announcements(force=False):
     processed = state.get("processed", {})
     if not isinstance(processed, dict):
         processed = {}
+    history = state.setdefault("history", {})
+    inventory = state.setdefault("articles", {})
+    attempts = state.setdefault("attempts", {})
     for source in ("Bitget", "Gate", "MEXC", "Binance"):
         try:
-            if source == "Binance":
-                articles = [{**a, "source": "Binance", "url": binance_announcement_url(a["code"])} for a in await fetch_binance_announcements()]
-            elif source == "Gate":
-                payload = await asyncio.to_thread(_exchange_http_json_sync, GATE_ANNOUNCEMENTS_URL,
-                                                  {"title_query": "dividend", "page": "1", "size": "50", "lang": "en", "pinned": 0})
-                articles = parse_gate_announcements(payload)
-            elif source == "Bitget" and (force or not state):
-                articles, _ = await search_bitget_announcements(["dividend"], limit=50)
-            else:
-                articles = await fetch_exchange_announcements(source)
+            articles, first_cursor = await dividend_history_page(source)
+            progress = history.setdefault(source, {"cursor": first_cursor, "complete": first_cursor is None})
+            if force and progress.get("complete"):
+                progress.update(cursor=first_cursor, complete=first_cursor is None)
+            for _ in range(5):
+                if progress.get("complete"):
+                    break
+                cursor = progress.get("cursor")
+                page, next_cursor = await dividend_history_page(source, cursor)
+                page_codes = [a["code"] for a in page]
+                if page_codes and page_codes == progress.get("last_page_codes"):
+                    raise ValueError("History endpoint repeated the previous page")
+                articles.extend(page)
+                if next_cursor == cursor and next_cursor is not None:
+                    raise ValueError("History cursor did not advance")
+                progress.update(cursor=next_cursor, complete=next_cursor is None, last_page_codes=page_codes)
+                await asyncio.sleep(0.45)
             for article in articles:
-                if "dividend" not in article["title"].casefold() or (not force and time.time() - processed.get(article["url"], 0) < STOCK_CALENDAR_REFRESH_SECONDS):
+                if "dividend" in article["title"].casefold():
+                    inventory[article["url"]] = article
+            save_stock_calendar_state({**state, "records": records, "processed": processed}, DIVIDEND_ANNOUNCEMENTS_STATE_FILE)
+            candidates = sorted((a for a in inventory.values() if a["source"] == source), key=lambda a: a.get("release_date", 0), reverse=True)
+            handled = 0
+            for article in candidates:
+                if (not force and time.time() - processed.get(article["url"], 0) < STOCK_CALENDAR_REFRESH_SECONDS):
                     continue
+                if not force and time.time() - attempts.get(article["url"], 0) < STOCK_CALENDAR_REFRESH_SECONDS:
+                    continue
+                if handled >= 20:
+                    break
+                handled += 1
+                attempts[article["url"]] = time.time()
                 try:
                     html = await asyncio.to_thread(fetch_dividend_article, article["url"])
                     found = parse_dividend_article(article, html)
@@ -2138,11 +2181,12 @@ async def sync_dividend_announcements(force=False):
                         logger.warning("[DIVIDEND PARSE] Нет подтверждённых строк: %s", article["url"])
                 except Exception as exc:
                     logger.warning("[DIVIDEND DETAIL] %s: %s", article["url"], exc)
+            logger.info("[DIVIDEND HISTORY] %s: complete=%s, cursor=%s, stored=%s", source, progress.get("complete"), progress.get("cursor"), len(candidates))
         except Exception as exc:
             logger.warning("[DIVIDEND FEED] %s: %s", source, exc)
     today = datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat()
     records = [r for r in records if r["ex_date"] >= today]
-    save_stock_calendar_state({"records": records, "processed": dict(sorted(processed.items(), key=lambda item: item[1])[-2000:]), "checked_at": time.time()}, DIVIDEND_ANNOUNCEMENTS_STATE_FILE)
+    save_stock_calendar_state({**state, "records": records, "processed": processed, "checked_at": time.time()}, DIVIDEND_ANNOUNCEMENTS_STATE_FILE)
     return records
 
 

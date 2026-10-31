@@ -3,6 +3,7 @@
 import re
 import urllib.request
 import urllib.parse
+from urllib.error import HTTPError
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
@@ -44,8 +45,40 @@ def fetch_article(url):
             "www.bitget.com", "www.gate.com", "www.mexc.com", "www.binance.com"}:
         raise ValueError("Unsupported announcement host")
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return response.read(4 * 1024 * 1024).decode("utf-8")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.read(4 * 1024 * 1024).decode("utf-8")
+    except HTTPError as exc:
+        if exc.code != 403 or parsed.hostname != "www.gate.com":
+            raise
+        try:
+            from curl_cffi import requests
+        except ImportError as missing:
+            raise RuntimeError("Gate HTTP 403: install requirements-dividends.txt") from missing
+        response = requests.get(url, impersonate="chrome", timeout=20)
+        response.raise_for_status()
+        return response.text
+
+
+def announcement_date(value):
+    parsed = parse_date(value)
+    if parsed:
+        return parsed
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(value.strip(), fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def settlement_datetime(value):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%B %d, %Y, %H:%M", "%B %d, %Y %H:%M", "%b %d, %Y, %H:%M"):
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            pass
+    return None
 
 
 def parse_article(article, html):
@@ -62,23 +95,23 @@ def parse_article(article, html):
             continue
         def field(predicate):
             return next((row[i] for i, heading in enumerate(headers) if predicate(heading)), "")
-        raw_symbol = field(lambda h: any(k in h for k in ("pair", "symbol", "ticker", "contract", "stock")))
+        raw_symbol = field(lambda h: any(k in h for k in ("pair", "symbol", "ticker", "contract", "stock", "futures market")))
         symbol = clean_ticker(raw_symbol.upper().replace("_USDT", "").removesuffix("USDT").removesuffix("STOCK"))
         amount = parse_number(field(lambda h: "dividend" in h and "usd" in h))
         ex_raw = field(lambda h: "ex" in h and "date" in h)
         ex_match = re.search(r"\d{4}-\d{2}-\d{2}", ex_raw)
-        ex_date = parse_date(ex_match[0]) if ex_match else None
+        ex_date = announcement_date(ex_match[0] if ex_match else ex_raw)
         if not symbol or not amount or not ex_date:
             continue
         settlement = None
         for i, heading in enumerate(headers):
             if not any(k in heading for k in ("settlement", "distribution", "snapshot")):
                 continue
-            match = re.search(r"(\d{4}-\d{2}-\d{2})[ T]+(\d{2}:\d{2}(?::\d{2})?)", row[i])
+            moment = settlement_datetime(row[i])
             zone = re.search(r"utc\s*([+-]\d{1,2})?", heading)
-            if match and zone:
+            if moment and zone:
                 offset = int(zone[1] or 0)
-                settlement = datetime.fromisoformat("T".join(match.groups())).replace(
+                settlement = moment.replace(
                     tzinfo=timezone(timedelta(hours=offset))).astimezone(timezone.utc).isoformat()
         records.append({"symbol": symbol, "ex_date": ex_date.isoformat(), "amount": amount,
                         "currency": "USD", "source": article["source"], "url": article["url"],
