@@ -10,6 +10,7 @@ import tempfile
 import zipfile
 import random
 import hmac
+import hashlib
 import threading
 import time
 import urllib.parse
@@ -2187,6 +2188,10 @@ def stock_calendar_pages(snapshot):
     return pages
 
 
+def stock_calendar_render_hash(snapshot):
+    return hashlib.sha256("\n".join(stock_calendar_pages(snapshot)).encode("utf-8")).hexdigest()
+
+
 async def publish_stock_calendar(settings, state):
     chat_id = settings.get("stock_calendar_target_chat_id")
     if chat_id is None:
@@ -2226,7 +2231,9 @@ async def publish_stock_calendar(settings, state):
     state["message_ids"] = new_ids
     state["published_chat_id"] = chat_id
     state["published_topic_id"] = topic_id
+    state["render_hash"] = hashlib.sha256("\n".join(pages).encode("utf-8")).hexdigest()
     save_stock_calendar_state(state)
+    logger.info("[STOCK CALENDAR] Опубликовано страниц: %s", len(pages))
 
 
 async def stock_calendar_loop():
@@ -2235,6 +2242,20 @@ async def stock_calendar_loop():
         try:
             settings = load_bot_settings()
             if settings.get("stock_calendar_enabled") and settings.get("stock_calendar_target_chat_id") is not None:
+                state = load_stock_calendar_state()
+                cached = state.get("snapshot")
+                same_target = (state.get("published_chat_id") == settings["stock_calendar_target_chat_id"]
+                               and state.get("published_topic_id") == settings["stock_calendar_target_topic_id"])
+                # Formatting changes must not wait for market data requests.
+                if cached and same_target and state.get("render_hash") != stock_calendar_render_hash(cached):
+                    try:
+                        await publish_stock_calendar(settings, state)
+                        state.pop("delivery_error", None)
+                        save_stock_calendar_state(state)
+                    except Exception as exc:
+                        state["delivery_error"] = str(exc)[:200]
+                        save_stock_calendar_state(state)
+                        raise
                 dividend_records = await sync_dividend_announcements(stock_calendar_refresh_requested)
                 state = load_stock_calendar_state()
                 last = state.get("snapshot", {}).get("checked_at")
