@@ -34,6 +34,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPre
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from stock_calendar import build_snapshot, load_state as load_stock_calendar_state, save_state as save_stock_calendar_state, due_reminders, format_russian_date, STATE_FILE as STOCK_CALENDAR_STATE_FILE
 from mexc_announcements import parse_mexc_announcements
+from dividend_announcements import parse_article as parse_dividend_article, fetch_article as fetch_dividend_article, merge_snapshot, STATE_FILE as DIVIDEND_ANNOUNCEMENTS_STATE_FILE
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
 logging.basicConfig(
@@ -136,6 +137,7 @@ DEFAULT_BOT_SETTINGS = {
     "browser_share_target_chat_id": None,
     "browser_share_target_topic_id": None,
     "stock_calendar_enabled": False,
+    "stock_calendar_blacklist": [],
     "stock_calendar_target_chat_id": None,
     "stock_calendar_target_topic_id": None,
 }
@@ -1860,7 +1862,7 @@ async def create_backup_archive() -> str | None:
                         BINANCE_ANNOUNCEMENTS_STATE_FILE,
                         arcname=BINANCE_ANNOUNCEMENTS_STATE_FILE,
                     )
-                for state_file in EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values():
+                for state_file in (*EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values(), DIVIDEND_ANNOUNCEMENTS_STATE_FILE):
                     if os.path.exists(state_file):
                         zf.write(state_file, arcname=state_file)
                 if os.path.exists(STOCK_CALENDAR_STATE_FILE):
@@ -1962,7 +1964,7 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
                     zf.extract(BOT_SETTINGS_FILE, path='.')
                 if BINANCE_ANNOUNCEMENTS_STATE_FILE in names:
                     zf.extract(BINANCE_ANNOUNCEMENTS_STATE_FILE, path='.')
-                for state_file in EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values():
+                for state_file in (*EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values(), DIVIDEND_ANNOUNCEMENTS_STATE_FILE):
                     if state_file in names:
                         zf.extract(state_file, path='.')
                 if STOCK_CALENDAR_STATE_FILE in names:
@@ -2102,22 +2104,74 @@ STOCK_CALENDAR_REFRESH_SECONDS = 8 * 60 * 60
 stock_calendar_refresh_requested = False
 
 
+async def sync_dividend_announcements(force=False):
+    state = load_stock_calendar_state(DIVIDEND_ANNOUNCEMENTS_STATE_FILE)
+    if not force and time.time() - state.get("checked_at", 0) < 300:
+        return state.get("records", [])
+    records = state.get("records", [])
+    processed = state.get("processed", {})
+    if not isinstance(processed, dict):
+        processed = {}
+    for source in ("Bitget", "Gate", "MEXC", "Binance"):
+        try:
+            if source == "Binance":
+                articles = [{**a, "source": "Binance", "url": binance_announcement_url(a["code"])} for a in await fetch_binance_announcements()]
+            elif source == "Gate":
+                payload = await asyncio.to_thread(_exchange_http_json_sync, GATE_ANNOUNCEMENTS_URL,
+                                                  {"title_query": "dividend", "page": "1", "size": "50", "lang": "en", "pinned": 0})
+                articles = parse_gate_announcements(payload)
+            elif source == "Bitget" and (force or not state):
+                articles, _ = await search_bitget_announcements(["dividend"], limit=50)
+            else:
+                articles = await fetch_exchange_announcements(source)
+            for article in articles:
+                if "dividend" not in article["title"].casefold() or (not force and time.time() - processed.get(article["url"], 0) < STOCK_CALENDAR_REFRESH_SECONDS):
+                    continue
+                try:
+                    html = await asyncio.to_thread(fetch_dividend_article, article["url"])
+                    found = parse_dividend_article(article, html)
+                    if found:
+                        records = [r for r in records if r["url"] != article["url"]] + found
+                        processed[article["url"]] = time.time()
+                    else:
+                        logger.warning("[DIVIDEND PARSE] Нет подтверждённых строк: %s", article["url"])
+                except Exception as exc:
+                    logger.warning("[DIVIDEND DETAIL] %s: %s", article["url"], exc)
+        except Exception as exc:
+            logger.warning("[DIVIDEND FEED] %s: %s", source, exc)
+    today = datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat()
+    records = [r for r in records if r["ex_date"] >= today]
+    save_stock_calendar_state({"records": records, "processed": dict(sorted(processed.items(), key=lambda item: item[1])[-2000:]), "checked_at": time.time()}, DIVIDEND_ANNOUNCEMENTS_STATE_FILE)
+    return records
+
+
 def stock_calendar_lines(snapshot):
     checked = format_russian_date(snapshot.get("checked_at"))
     lines = [
         "📅 <b>Дивидендный календарь</b>",
         f"Последняя проверка: {escape(checked)}\n",
     ]
+    blacklist = load_bot_settings().get("stock_calendar_blacklist", [])
     for event in snapshot.get("events", []):
+        if event["symbol"] in blacklist:
+            continue
         amount = event["amount"]
         price = event.get("price")
         yield_pct = event.get("event_yield_pct")
         rate = f"{yield_pct:.3f}% от ${price:g}" if yield_pct is not None else "% нет"
         lines.append(
-            f"<b>{escape(format_russian_date(event['ex_date']))} · {escape(event['symbol'])}</b> "
+            f"<b>Экс-дата: {escape(format_russian_date(event['ex_date']))} · {escape(event['symbol'])}</b> "
             f"${amount:g} · {rate}\n"
             f"Биржи с USDT-фьючерсом на этот тикер: {escape(', '.join(event['exchanges']))}"
         )
+        confirmations = event.get("confirmations", {})
+        for exchange, record in sorted(confirmations.items()):
+            moment = record.get("settlement_at")
+            when = datetime.fromisoformat(moment).astimezone(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M МСК") if moment else "время расчёта не распознано"
+            lines.append(f'✅ <a href="{escape(record["url"], quote=True)}">{escape(exchange)}</a>: ${record["amount"]:g} · {when}')
+        pending = sorted(set(event.get("exchanges", [])) - set(confirmations))
+        if pending:
+            lines.append("Выплата не подтверждена: " + escape(", ".join(pending)))
     if not snapshot.get("events"):
         lines.append("Пока нет объявленных выплат.")
     return lines
@@ -2183,6 +2237,7 @@ async def stock_calendar_loop():
         try:
             settings = load_bot_settings()
             if settings.get("stock_calendar_enabled") and settings.get("stock_calendar_target_chat_id") is not None:
+                dividend_records = await sync_dividend_announcements(stock_calendar_refresh_requested)
                 state = load_stock_calendar_state()
                 last = state.get("snapshot", {}).get("checked_at")
                 try:
@@ -2199,6 +2254,8 @@ async def stock_calendar_loop():
                     stock_calendar_refresh_requested = False
                     try:
                         snapshot = await asyncio.to_thread(build_snapshot)
+                        if snapshot.get("errors", {}).get("Nasdaq calendar") and "Massive" not in {e.get("source") for e in snapshot["events"]}:
+                            snapshot["events"] = state.get("snapshot", {}).get("events", [])
                         state["snapshot"] = snapshot
                         state.pop("last_error", None)
                         state["needs_publish"] = True
@@ -2214,6 +2271,13 @@ async def stock_calendar_loop():
                         save_stock_calendar_state(state)
                         logger.exception("[STOCK CALENDAR] Обновление не удалось")
                 snapshot = state.get("snapshot")
+                if snapshot:
+                    merged = merge_snapshot(snapshot, dividend_records, today=datetime.now(ZoneInfo("Europe/Kyiv")).date())
+                    if merged != snapshot:
+                        snapshot = merged
+                        state["snapshot"] = snapshot
+                        state["needs_publish"] = True
+                        save_stock_calendar_state(state)
                 if snapshot and age < 12 * 60 * 60:
                     target_changed = (state.get("published_chat_id") != settings["stock_calendar_target_chat_id"]
                                       or state.get("published_topic_id") != settings["stock_calendar_target_topic_id"])
@@ -2243,14 +2307,12 @@ async def stock_calendar_loop():
                     today = datetime.now(ZoneInfo("Europe/Kyiv")).date()
                     sent = set(state.get("sent_reminders", []))
                     for event in due_reminders(snapshot, sent, today) if not state.get("last_error") else []:
+                        if event["symbol"] in settings.get("stock_calendar_blacklist", []):
+                            continue
                         key = f"{event['symbol']}:{event['ex_date']}"
                         rate = event.get("event_yield_pct")
                         rate_text = f"{rate:.3f}% от цены акции" if rate is not None else "% недоступен"
-                        text = (f"⏰ <b>Через 3 дня ex-dividend: {escape(event['symbol'])}</b>\n"
-                                f"Дата: {escape(event['ex_date'])}\n"
-                                f"Выплата: ${event['amount']:g} на акцию · {rate_text}\n"
-                                f"Биржи с USDT-фьючерсом на этот тикер: {escape(', '.join(event['exchanges']))}\n"
-                                "Источник: Nasdaq. Фьючерс не даёт права на дивиденд.")
+                        text = f"⏰ <b>Через 3 дня ex-dividend</b>\n" + "\n".join(stock_calendar_lines({"checked_at": snapshot.get("checked_at"), "events": [event]})[2:])
                         await bot_app.bot.send_message(
                             chat_id=settings["stock_calendar_target_chat_id"],
                             message_thread_id=settings["stock_calendar_target_topic_id"],
@@ -2280,6 +2342,7 @@ async def show_stock_calendar_menu(query):
                               callback_data="stock_calendar_toggle")],
         [InlineKeyboardButton("🎯 ЧАТ / ТОПИК", callback_data="stock_calendar_target")],
         [InlineKeyboardButton("🔄 ОБНОВИТЬ", callback_data="stock_calendar_refresh")],
+        [InlineKeyboardButton("BLACKLIST", callback_data="stock_calendar_blacklist")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="bot_settings")],
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -2539,6 +2602,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пример: <code>-1001234567890 777</code> или <code>-1001234567890</code>",
             parse_mode="HTML")
 
+    elif data == "stock_calendar_blacklist":
+        user_edit_state[query.from_user.id] = {"mode": "stock_calendar_blacklist"}
+        current = ", ".join(load_bot_settings().get("stock_calendar_blacklist", [])) or "пусто"
+        await query.message.reply_text("Blacklist: " + current + "\nВведите полный список тикеров через запятую, например STRC, TSLA. Для очистки: 0.")
+
     elif data == "stock_calendar_toggle":
         settings = load_bot_settings()
         if not settings["stock_calendar_enabled"] and settings["stock_calendar_target_chat_id"] is None:
@@ -2771,6 +2839,20 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_bot_settings(settings)
         topic_text = f", топик `{target_topic_id}`" if target_topic_id else " без топика"
         text = f"✅ Ссылки из браузера будут отправляться в чат `{target_chat_id}`{topic_text}."
+
+    elif state["mode"] == "stock_calendar_blacklist":
+        from stock_calendar import clean_ticker
+        values = [v.strip().upper() for v in re.split(r"[,\s]+", new_input) if v.strip()] if new_input != "0" else []
+        if any(not clean_ticker(v) for v in values):
+            await update.message.reply_text("Некорректный тикер. Пример: STRC, TSLA")
+            return
+        settings = load_bot_settings()
+        settings["stock_calendar_blacklist"] = sorted(set(values))
+        save_bot_settings(settings)
+        calendar_state = load_stock_calendar_state()
+        calendar_state["needs_publish"] = True
+        save_stock_calendar_state(calendar_state)
+        text = "✅ Blacklist сохранён: " + (", ".join(values) or "пусто")
 
     elif state["mode"] == "stock_calendar_target":
         parsed_target = parse_optional_chat_topic_target(new_input)

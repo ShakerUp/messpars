@@ -281,8 +281,39 @@ def build_snapshot(today=None, get=get_json):
     if not symbols:
         raise ValueError("Не удалось подтвердить ни одного фондового USDT-контракта: " + str(errors))
     end = date(today.year, 12, 31)
-    events = fetch_dividends(today, end, get) if today <= end else []
-    prices = fetch_prices(get)
+    try:
+        events = fetch_dividends(today, end, get) if today <= end else []
+    except Exception as exc:
+        errors["Nasdaq calendar"] = str(exc)[:160]
+        events = []
+    massive_key = os.getenv("MASSIVE_API_KEY", "").strip()
+    if massive_key:
+        try:
+            url = "https://api.massive.com/stocks/v1/dividends"
+            params = {"ex_dividend_date.gte": today.isoformat(), "ex_dividend_date.lte": end.isoformat(), "limit": 1000}
+            for _ in range(20):
+                payload = get(url, params, headers={"Authorization": f"Bearer {massive_key}"})
+                if payload.get("status") != "OK" or not isinstance(payload.get("results"), list):
+                    raise ValueError("Massive dividends unavailable")
+                for row in payload["results"]:
+                    if row.get("currency") == "USD" and clean_ticker(row.get("ticker")) and parse_date(row.get("ex_dividend_date")) and parse_number(row.get("cash_amount")):
+                        events.append({"symbol": row["ticker"], "ex_date": row["ex_dividend_date"],
+                                       "amount": row["cash_amount"], "currency": "USD", "source": "Massive"})
+                url = payload.get("next_url")
+                if not url:
+                    break
+                if urllib.parse.urlparse(url).hostname != "api.massive.com":
+                    raise ValueError("Unexpected Massive pagination host")
+                params = None
+            else:
+                raise ValueError("Massive pagination limit exceeded")
+        except Exception:
+            errors["Massive"] = "Не удалось загрузить календарь Massive"
+    try:
+        prices = fetch_prices(get)
+    except Exception as exc:
+        errors["Nasdaq prices"] = str(exc)[:160]
+        prices = {}
     matched = {}
     for event in events:
         symbol = event["symbol"]
@@ -293,7 +324,7 @@ def build_snapshot(today=None, get=get_json):
         enriched = {**event, "exchanges": sorted(symbols[symbol]), "price": price,
                     "event_yield_pct": round(event["amount"] / price * 100, 4) if price else None}
         matched[(symbol, event["ex_date"])] = enriched
-    return {"checked_at": datetime.now(timezone.utc).isoformat(),
+    return {"checked_at": datetime.now(timezone.utc).isoformat(), "prices": prices,
             "symbols": {symbol: sorted(exchanges) for symbol, exchanges in symbols.items()},
             "errors": errors, "events": sorted(matched.values(), key=lambda row: (row["ex_date"], row["symbol"])),
             "calendar_end": end.isoformat(), "price_source": "Nasdaq last sale"}
