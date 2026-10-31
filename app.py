@@ -2156,23 +2156,21 @@ def stock_calendar_lines(snapshot):
         if event["symbol"] in blacklist:
             continue
         amount = event["amount"]
-        price = event.get("price")
         yield_pct = event.get("event_yield_pct")
-        rate = f"{yield_pct:.3f}% от ${price:g}" if yield_pct is not None else "% нет"
-        lines.append(
-            f"<b>Экс-дата: {escape(format_russian_date(event['ex_date']))} · {escape(event['symbol'])}</b> "
-            f"${amount:g} · {rate}\n"
-            f"Биржи с USDT-фьючерсом на этот тикер: {escape(', '.join(event['exchanges']))}"
-        )
+        rate = f" · {yield_pct:.2f}%" if yield_pct is not None else ""
+        ex_date = format_russian_date(event["ex_date"]).rsplit(" ", 1)[0]
+        block = [
+            f"<b>{escape(event['symbol'])}</b> · экс {escape(ex_date)} · ${amount:g}{rate}",
+            f"Фьючерсы: {escape(', '.join(event['exchanges']))}",
+        ]
         confirmations = event.get("confirmations", {})
         for exchange, record in sorted(confirmations.items()):
             moment = record.get("settlement_at")
-            when = datetime.fromisoformat(moment).astimezone(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M МСК") if moment else "время расчёта не распознано"
-            lines.append(f'✅ <a href="{escape(record["url"], quote=True)}">{escape(exchange)}</a>: ${record["amount"]:g} · {when}')
-        pending = sorted(set(event.get("exchanges", [])) - set(confirmations))
-        if pending:
-            lines.append("Выплата не подтверждена: " + escape(", ".join(pending)))
-    if not snapshot.get("events"):
+            when = datetime.fromisoformat(moment).astimezone(timezone(timedelta(hours=3))).strftime("%d.%m %H:%M МСК") if moment else "время уточняется"
+            amount_note = f' · ${record["amount"]:g}' if record["amount"] != amount else ""
+            block.append(f'✅ <a href="{escape(record["url"], quote=True)}">{escape(exchange)}</a> · {when}{amount_note}')
+        lines.append("\n".join(block) + "\n")
+    if len(lines) == 2:
         lines.append("Пока нет объявленных выплат.")
     return lines
 
