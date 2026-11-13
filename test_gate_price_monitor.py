@@ -72,8 +72,29 @@ class GatePriceTests(unittest.TestCase):
         signal["metadata"] = {}
         self.assertIn("Тип не определён", monitor.alert_text(signal, "now"))
 
+    def test_position_limit_matches_displayed_leverage(self):
+        tiers = [{"leverage_max": "5", "risk_limit": "5000"},
+                 {"leverage_max": "4", "risk_limit": "7000"},
+                 {"leverage_max": "1.01", "risk_limit": "2000000"}]
+        self.assertEqual(monitor.limit_for_leverage(tiers, "5"), Decimal(5000))
+        self.assertEqual(monitor.limit_for_leverage(tiers, "4"), Decimal(7000))
+        self.assertIsNone(monitor.limit_for_leverage(tiers, "6"))
+        signal = {"contract": "SPACEHOOD_USDT", "last": Decimal("0.0012"), "mark": Decimal("0.000822"),
+                  "deviation": Decimal("45.99"), "metadata": {"contract_type": "", "leverage_max": "5",
+                  "position_limit": "5000", "risk_limit_max": "2000000"}}
+        text = monitor.alert_text(signal, "now")
+        self.assertIn("Макс. позиция (5x): 5 000 USDT", text)
+        self.assertNotIn("2 000 000", text)
+        self.assertNotIn("Gate ·", text)
+        self.assertIn("SPACEHOODUSDT", text)
+
 
 class GatePriceWorkerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        limiter = patch.object(monitor, "fetch_position_limit", new=AsyncMock(return_value=None))
+        limiter.start()
+        self.addCleanup(limiter.stop)
+
     def book(self):
         book = monitor.AlertBook({})
         book.configure({"gate_price_enabled": True, "gate_price_target_chat_id": -100123,

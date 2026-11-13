@@ -18,6 +18,7 @@ COOLDOWN_SECONDS = 15 * 60
 MIN_ALERT_SECONDS = 3
 GROWTH_POINTS = Decimal("10")
 HEALTH = {}
+POSITION_LIMITS = {}
 logger = logging.getLogger(__name__)
 RWA_TYPES = {"stocks": "акции", "metals": "металлы", "indices": "индексы",
              "forex": "валюты", "commodities": "сырьё", "rwa": "RWA"}
@@ -86,23 +87,52 @@ def should_alert(signal, previous, now):
             or elapsed >= COOLDOWN_SECONDS)
 
 
+def limit_for_leverage(tiers, leverage):
+    leverage = number(leverage)
+    if leverage is None or not isinstance(tiers, list):
+        return None
+    eligible = []
+    for tier in tiers:
+        maximum, limit = number(tier.get("leverage_max")), number(tier.get("risk_limit"))
+        if maximum is not None and limit is not None and maximum >= leverage:
+            eligible.append(limit)
+    return max(eligible) if eligible else None
+
+
+async def fetch_position_limit(signal):
+    metadata = signal["metadata"]
+    key = (signal["contract"], str(metadata.get("leverage_max")), str(metadata.get("config_change_time")))
+    cached = POSITION_LIMITS.get(key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        tiers = await asyncio.to_thread(get_json, BASE_URL + "/risk_limit_tiers", {"contract": signal["contract"]})
+        limit = limit_for_leverage(tiers, metadata.get("leverage_max"))
+        POSITION_LIMITS[key] = (time.monotonic() + (900 if limit is not None else 60), limit)
+        return limit
+    except Exception as exc:
+        logger.warning("[GATE POSITION LIMIT] %s: %s", signal["contract"], exc)
+        POSITION_LIMITS[key] = (time.monotonic() + 60, None)
+        return None
+
+
 def alert_text(signal, detected_at):
     metadata = signal["metadata"]
     category = metadata.get("contract_type")
     kind = "RWA · " + RWA_TYPES[category] if category in RWA_TYPES else (
         "Крипта" if category in {"", "crypto"} else "Тип не определён")
-    leverage, risk = number(metadata.get("leverage_max")), number(metadata.get("risk_limit_max"))
+    leverage, limit = number(metadata.get("leverage_max")), number(metadata.get("position_limit"))
     leverage_text = f"{leverage:g}x" if leverage else "нет данных"
-    risk_text = f"{risk:,.0f} USDT".replace(",", " ") if risk else "нет данных"
+    limit_text = f"{limit:,.0f} USDT".replace(",", " ") if limit else "нет данных"
     status_text = "\n⚠️ Контракт в процессе делистинга" if metadata.get("in_delisting") or metadata.get("status") == "delisting" else ""
     name = signal["contract"]
     return (
-        f'<b>Gate · {signal["deviation"]:+.2f}%</b>\n'
-        f'<a href="https://www.gate.com/futures/USDT/{escape(name, quote=True)}">{escape(name)}</a> · {kind}\n\n'
+        f'<b>{signal["deviation"]:+.2f}% · '
+        f'<a href="https://www.gate.com/futures/USDT/{escape(name, quote=True)}">{escape(name.replace("_USDT", "USDT"))}</a> · {kind}</b>\n\n'
         f'Цена: <b>{signal["last"]:f}</b>\n'
         f'Справедливая: <b>{signal["mark"]:f}</b>\n'
         f'Макс. плечо: {leverage_text}\n'
-        f'Макс. лимит риска: {risk_text}{status_text}\n\n'
+        f'Макс. позиция ({leverage_text}): {limit_text}{status_text}\n\n'
         f'Обнаружено: {detected_at} (Киев)'
     )
 
@@ -238,9 +268,20 @@ async def dispatch_alerts(book, send, kyiv_zone):
         current = book.latest.get(name)
         if current is not signal or not should_alert(signal, book.state["alerts"].get(name), time.time()):
             continue
+        config = book.state.get("config")
+        limit = await fetch_position_limit(signal)
+        current = book.latest.get(name)
+        if (not book.enabled or book.state.get("config") != config or current is None
+                or time.time() - current["received_at"] >= 30
+                or not should_alert(current, book.state["alerts"].get(name), time.time())):
+            continue
+        if current["metadata"].get("leverage_max") != signal["metadata"].get("leverage_max"):
+            continue
+        signal = current
+        enriched = {**signal, "metadata": {**signal["metadata"], "position_limit": limit}}
         episode = book.episodes.get(name, 0)
         config = book.state.get("config")
-        await send(book.settings, alert_text(signal, datetime.now(kyiv_zone).strftime("%d.%m %H:%M:%S")))
+        await send(book.settings, alert_text(enriched, datetime.now(kyiv_zone).strftime("%d.%m %H:%M:%S")))
         if book.state.get("config") == config:
             book.acknowledge(signal, episode, time.time())
             save_state(book.state, STATE_FILE)
