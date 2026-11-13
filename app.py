@@ -35,6 +35,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPre
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from stock_calendar import build_snapshot, load_state as load_stock_calendar_state, save_state as save_stock_calendar_state, due_reminders, format_russian_date, STATE_FILE as STOCK_CALENDAR_STATE_FILE
 from mexc_announcements import parse_mexc_announcements
+import gate_price_monitor as gate_prices
 from dividend_announcements import parse_article as parse_dividend_article, fetch_article as fetch_dividend_article, merge_snapshot, STATE_FILE as DIVIDEND_ANNOUNCEMENTS_STATE_FILE
 
 # ====== НАСТРОЙКА ЛОГИРОВАНИЯ ======
@@ -126,6 +127,11 @@ BROWSER_RELAY_MAX_BODY_BYTES = 16 * 1024
 BROWSER_RELAY_REQUEST_TIMEOUT = 25
 
 DEFAULT_BOT_SETTINGS = {
+    "gate_price_enabled": False,
+    "gate_price_target_chat_id": None,
+    "gate_price_target_topic_id": None,
+    "gate_price_threshold_pct": 5.0,
+    "gate_price_blacklist": [],
     "presence_enabled": PRESENCE_ENABLED,
     "presence_online_from": PRESENCE_ONLINE_FROM_KYIV,
     "presence_online_until": PRESENCE_ONLINE_UNTIL_KYIV,
@@ -196,6 +202,14 @@ def load_bot_settings() -> dict:
     )
     settings["exchange_dividends_enabled"] = bool(settings.get("exchange_dividends_enabled"))
     settings["stock_calendar_enabled"] = bool(settings.get("stock_calendar_enabled"))
+    settings["gate_price_enabled"] = bool(settings.get("gate_price_enabled"))
+    threshold = gate_prices.number(settings.get("gate_price_threshold_pct"))
+    settings["gate_price_threshold_pct"] = float(threshold) if threshold and gate_prices.number("0.01") <= threshold <= 10000 else 5.0
+    blocked = settings.get("gate_price_blacklist", [])
+    try:
+        settings["gate_price_blacklist"] = gate_prices.parse_blacklist(",".join(blocked)) if isinstance(blocked, list) else []
+    except (ValueError, TypeError):
+        settings["gate_price_blacklist"] = []
     settings["announcements_enabled"] = (
         bool(settings.get("announcements_enabled"))
         if "announcements_enabled" in saved else
@@ -213,11 +227,15 @@ def load_bot_settings() -> dict:
         "browser_share_target_topic_id",
         "stock_calendar_target_chat_id",
         "stock_calendar_target_topic_id",
+        "gate_price_target_chat_id",
+        "gate_price_target_topic_id",
     ):
         try:
             settings[key] = int(settings[key]) if settings.get(key) is not None else None
         except (TypeError, ValueError):
             settings[key] = None
+    if settings.get("gate_price_target_topic_id") == 0:
+        settings["gate_price_target_topic_id"] = None
     return settings
 
 def save_bot_settings(settings: dict):
@@ -265,12 +283,14 @@ def parse_chat_topic_target(text: str) -> tuple[int, int] | None:
         return None
     return chat_id, topic_id
 
-def parse_optional_chat_topic_target(text: str) -> tuple[int, int | None] | None:
+def parse_optional_chat_topic_target(text: str, allow_zero_topic: bool = False) -> tuple[int, int | None] | None:
     match = re.match(r"^\s*(-?\d+)(?:\s+(\d+))?\s*$", text or "")
     if not match:
         return None
     chat_id = int(match.group(1))
     topic_id = int(match.group(2)) if match.group(2) else None
+    if topic_id == 0 and allow_zero_topic:
+        topic_id = None
     if chat_id == 0:
         return None
     if topic_id is not None and topic_id <= 0:
@@ -1865,7 +1885,7 @@ async def create_backup_archive() -> str | None:
                         BINANCE_ANNOUNCEMENTS_STATE_FILE,
                         arcname=BINANCE_ANNOUNCEMENTS_STATE_FILE,
                     )
-                for state_file in (*EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values(), DIVIDEND_ANNOUNCEMENTS_STATE_FILE):
+                for state_file in (*EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values(), DIVIDEND_ANNOUNCEMENTS_STATE_FILE, gate_prices.STATE_FILE):
                     if os.path.exists(state_file):
                         zf.write(state_file, arcname=state_file)
                 if os.path.exists(STOCK_CALENDAR_STATE_FILE):
@@ -1967,7 +1987,7 @@ async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TY
                     zf.extract(BOT_SETTINGS_FILE, path='.')
                 if BINANCE_ANNOUNCEMENTS_STATE_FILE in names:
                     zf.extract(BINANCE_ANNOUNCEMENTS_STATE_FILE, path='.')
-                for state_file in (*EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values(), DIVIDEND_ANNOUNCEMENTS_STATE_FILE):
+                for state_file in (*EXCHANGE_ANNOUNCEMENTS_STATE_FILES.values(), DIVIDEND_ANNOUNCEMENTS_STATE_FILE, gate_prices.STATE_FILE):
                     if state_file in names:
                         zf.extract(state_file, path='.')
                 if STOCK_CALENDAR_STATE_FILE in names:
@@ -2411,6 +2431,51 @@ async def show_stock_calendar_menu(query):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 
+async def send_gate_price_alert(settings, text):
+    target = {"chat_id": settings["gate_price_target_chat_id"]}
+    if settings.get("gate_price_target_topic_id"):
+        target["message_thread_id"] = settings["gate_price_target_topic_id"]
+    await bot_app.bot.send_message(
+        **target,
+        text=text, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def show_gate_price_menu(query):
+    settings = load_bot_settings()
+    target = settings.get("gate_price_target_chat_id")
+    topic = settings.get("gate_price_target_topic_id")
+    target_text = f"<code>{target}</code>" if target is not None else "не задан"
+    if topic is not None:
+        target_text += f" / топик <code>{topic}</code>"
+    elif target is not None:
+        target_text += " · без топика"
+    blocked = ", ".join(settings["gate_price_blacklist"]) or "пусто"
+    text = (
+        "<b>Gate Futures · отклонение цены</b>\n\n"
+        f"Монитор: {'ВКЛ' if settings['gate_price_enabled'] else 'ВЫКЛ'}\n"
+        f"Порог: ±{settings['gate_price_threshold_pct']:g}% от справедливой цены\n"
+        f"Чат: {target_text}\n"
+        f"Blacklist: {escape(blocked)}\n"
+        "Цены: WebSocket · повтор: 15 мин.\n"
+        "Рост на 10 п.п. · cooldown уведомлений: 3 сек.\n"
+        "USDT-контракты · RWA и крипта"
+    )
+    if gate_prices.HEALTH.get("last_scan"):
+        moment = datetime.fromisoformat(gate_prices.HEALTH["last_scan"]).astimezone(ZoneInfo("Europe/Kyiv"))
+        text += f"\nПроверено: {moment:%d.%m %H:%M:%S} · {gate_prices.HEALTH['checked']} контрактов"
+    if gate_prices.HEALTH.get("error"):
+        text += "\nОшибка: " + escape(gate_prices.HEALTH["error"])
+    keyboard = [
+        [InlineKeyboardButton("ВЫКЛЮЧИТЬ" if settings["gate_price_enabled"] else "ВКЛЮЧИТЬ", callback_data="gate_price_toggle")],
+        [InlineKeyboardButton("ЧАТ / ТОПИК", callback_data="gate_price_target")],
+        [InlineKeyboardButton("ТЕСТОВОЕ СООБЩЕНИЕ", callback_data="gate_price_test")],
+        [InlineKeyboardButton("ПОРОГ %", callback_data="gate_price_threshold")],
+        [InlineKeyboardButton("BLACKLIST", callback_data="gate_price_blacklist")],
+        [InlineKeyboardButton("Назад", callback_data="bot_settings")],
+    ]
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 async def show_bot_menu(query):
     settings = load_bot_settings()
     presence_enabled = settings.get("presence_enabled", True)
@@ -2432,6 +2497,7 @@ async def show_bot_menu(query):
         [InlineKeyboardButton("🕘 ИЗМЕНИТЬ ВРЕМЯ ONLINE", callback_data="bot_presence_time")],
         [InlineKeyboardButton("📰 АНОНСЫ БИРЖ", callback_data="bot_binance_settings")],
         [InlineKeyboardButton("📅 ДИВИДЕНДНЫЙ КАЛЕНДАРЬ", callback_data="stock_calendar_settings")],
+        [InlineKeyboardButton("GATE · ОТКЛОНЕНИЯ ЦЕНЫ", callback_data="gate_price_settings")],
         [InlineKeyboardButton("🌐 КНОПКА В БРАУЗЕРЕ", callback_data="bot_browser_share_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
     ]
@@ -2654,6 +2720,40 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "bot_settings":
         await show_bot_menu(query)
+
+    elif data == "gate_price_settings":
+        await show_gate_price_menu(query)
+
+    elif data == "gate_price_toggle":
+        settings = load_bot_settings()
+        if not settings["gate_price_enabled"] and settings["gate_price_target_chat_id"] is None:
+            await query.message.reply_text("Сначала задайте чат/топик для уведомлений.")
+        else:
+            settings["gate_price_enabled"] = not settings["gate_price_enabled"]
+            save_bot_settings(settings)
+        await show_gate_price_menu(query)
+
+    elif data == "gate_price_test":
+        settings = load_bot_settings()
+        if settings.get("gate_price_target_chat_id") is None:
+            await query.message.reply_text("Сначала задайте ID чата для Gate.")
+        else:
+            try:
+                await send_gate_price_alert(settings,
+                    "<b>Gate Futures · тест доставки</b>\nСообщение доставлено. Уведомления Gate будут приходить сюда при включённом мониторе.")
+                await query.message.reply_text("Тестовое сообщение отправлено в настроенный чат.")
+            except Exception as exc:
+                logger.warning("[GATE PRICE TEST] %s", exc)
+                await query.message.reply_text("Не удалось отправить тест: " + str(exc))
+
+    elif data in {"gate_price_target", "gate_price_threshold", "gate_price_blacklist"}:
+        user_edit_state[query.from_user.id] = {"mode": data}
+        prompts = {
+            "gate_price_target": "Без топиков: -1001234567890\nС топиком: -1001234567890 777\nТопик 0 также означает отправку без топика.",
+            "gate_price_threshold": "Введите порог отклонения в процентах, например 5 или 2.5. Учитываются отклонения в обе стороны.",
+            "gate_price_blacklist": "Введите полный blacklist через запятую: BTC, ETH_USDT. Для очистки: 0.",
+        }
+        await query.message.reply_text(prompts[data])
 
     elif data == "stock_calendar_settings":
         await show_stock_calendar_menu(query)
@@ -2886,7 +2986,29 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = state.get("cid")
     text = None
 
-    if state["mode"] == "browser_share_target":
+    if state["mode"] in {"gate_price_target", "gate_price_threshold", "gate_price_blacklist"}:
+        settings = load_bot_settings()
+        try:
+            if state["mode"] == "gate_price_target":
+                target = parse_optional_chat_topic_target(new_input, allow_zero_topic=True)
+                if not target:
+                    raise ValueError("Введите ID чата и необязательный ID топика через пробел.")
+                settings["gate_price_target_chat_id"], settings["gate_price_target_topic_id"] = target
+            elif state["mode"] == "gate_price_threshold":
+                value = gate_prices.number(new_input.replace(",", "."))
+                if value is None or not gate_prices.number("0.01") <= value <= 10000:
+                    raise ValueError("Порог должен быть от 0.01 до 10000 процентов.")
+                settings["gate_price_threshold_pct"] = float(value)
+            else:
+                settings["gate_price_blacklist"] = gate_prices.parse_blacklist(new_input)
+            save_bot_settings(settings)
+            text = "Настройки Gate сохранены."
+        except ValueError as exc:
+            user_edit_state[user_id] = state
+            await update.message.reply_text(str(exc))
+            return
+
+    elif state["mode"] == "browser_share_target":
         parsed_target = parse_optional_chat_topic_target(new_input)
         if not parsed_target:
             await update.message.reply_text(
@@ -3548,6 +3670,7 @@ async def main():
         for source in EXCHANGE_ANNOUNCEMENTS_STATE_FILES
     ]
     stock_calendar_task = asyncio.create_task(stock_calendar_loop())
+    gate_price_task = asyncio.create_task(gate_prices.monitor(load_bot_settings, send_gate_price_alert, ZoneInfo("Europe/Kyiv")))
     start_browser_share_relay(asyncio.get_running_loop())
     logger.info("🚀 Бот запущен. Поддержка множественных каналов назначения активна.")
 
@@ -3562,11 +3685,13 @@ async def main():
         for task in exchange_announcements_tasks:
             task.cancel()
         stock_calendar_task.cancel()
+        gate_price_task.cancel()
         await asyncio.gather(
             presence_task,
             binance_announcements_task,
             *exchange_announcements_tasks,
             stock_calendar_task,
+            gate_price_task,
             return_exceptions=True,
         )
         try:
