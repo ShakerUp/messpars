@@ -83,7 +83,8 @@ class GatePriceTests(unittest.TestCase):
                   "deviation": Decimal("45.99"), "metadata": {"contract_type": "", "leverage_max": "5",
                   "position_limit": "5000", "risk_limit_max": "2000000"}}
         text = monitor.alert_text(signal, "now")
-        self.assertIn("Макс. позиция (5x): 5 000 USDT", text)
+        self.assertIn("\n\nМакс. позиция (5x): 5 000 $", text)
+        self.assertNotIn("Макс. плечо:", text)
         self.assertNotIn("2 000 000", text)
         self.assertNotIn("Gate ·", text)
         self.assertIn("SPACEHOODUSDT", text)

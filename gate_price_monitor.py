@@ -123,15 +123,14 @@ def alert_text(signal, detected_at):
         "Крипта" if category in {"", "crypto"} else "Тип не определён")
     leverage, limit = number(metadata.get("leverage_max")), number(metadata.get("position_limit"))
     leverage_text = f"{leverage:g}x" if leverage else "нет данных"
-    limit_text = f"{limit:,.0f} USDT".replace(",", " ") if limit else "нет данных"
+    limit_text = f"{limit:,.0f} $".replace(",", " ") if limit else "нет данных"
     status_text = "\n⚠️ Контракт в процессе делистинга" if metadata.get("in_delisting") or metadata.get("status") == "delisting" else ""
     name = signal["contract"]
     return (
         f'<b>{signal["deviation"]:+.2f}% · '
         f'<a href="https://www.gate.com/futures/USDT/{escape(name, quote=True)}">{escape(name.replace("_USDT", "USDT"))}</a> · {kind}</b>\n\n'
         f'Цена: <b>{signal["last"]:f}</b>\n'
-        f'Справедливая: <b>{signal["mark"]:f}</b>\n'
-        f'Макс. плечо: {leverage_text}\n'
+        f'Справедливая: <b>{signal["mark"]:f}</b>\n\n'
         f'Макс. позиция ({leverage_text}): {limit_text}{status_text}\n\n'
         f'Обнаружено: {detected_at} (Киев)'
     )

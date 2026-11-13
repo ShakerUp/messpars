@@ -2449,7 +2449,7 @@ async def show_gate_price_menu(query):
         target_text += f" / топик <code>{topic}</code>"
     elif target is not None:
         target_text += " · без топика"
-    blocked = ", ".join(settings["gate_price_blacklist"]) or "пусто"
+    blocked = f"{len(settings['gate_price_blacklist'])} тикеров"
     text = (
         "<b>Gate Futures · отклонение цены</b>\n\n"
         f"Монитор: {'ВКЛ' if settings['gate_price_enabled'] else 'ВЫКЛ'}\n"
@@ -2476,6 +2476,35 @@ async def show_gate_price_menu(query):
         [InlineKeyboardButton("Назад", callback_data="bot_settings")],
     ]
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_gate_blacklist(query=None, message=None, page=0):
+    blocked = load_bot_settings()["gate_price_blacklist"]
+    page_count = max(1, (len(blocked) + 9) // 10)
+    page = max(0, min(page, page_count - 1))
+    text = f"<b>Gate · Blacklist</b>\nТикеров: {len(blocked)}"
+    if not blocked:
+        text += "\nСписок пуст."
+    keyboard = [[InlineKeyboardButton("+ ДОБАВИТЬ", callback_data="gpb_add")]]
+    for name in blocked[page * 10:(page + 1) * 10]:
+        keyboard.append([InlineKeyboardButton(
+            "Убрать " + name.removesuffix("_USDT"), callback_data=f"gpb_del:{page}:{name}")])
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton("Предыдущая", callback_data=f"gpb_page:{page - 1}"))
+    if page + 1 < page_count:
+        navigation.append(InlineKeyboardButton("Следующая", callback_data=f"gpb_page:{page + 1}"))
+    if navigation:
+        text += f"\nСтраница {page + 1} из {page_count}"
+        keyboard.append(navigation)
+    if blocked:
+        keyboard.append([InlineKeyboardButton("ОЧИСТИТЬ СПИСОК", callback_data="gpb_clear")])
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="gate_price_settings")])
+    markup = InlineKeyboardMarkup(keyboard)
+    if query is not None:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def show_bot_menu(query):
@@ -2724,6 +2753,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_bot_menu(query)
 
     elif data == "gate_price_settings":
+        user_edit_state.pop(query.from_user.id, None)
         await show_gate_price_menu(query)
 
     elif data == "gate_price_toggle":
@@ -2748,12 +2778,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("[GATE PRICE TEST] %s", exc)
                 await query.message.reply_text("Не удалось отправить тест: " + str(exc))
 
-    elif data in {"gate_price_target", "gate_price_threshold", "gate_price_blacklist"}:
+    elif data == "gate_price_blacklist" or data.startswith("gpb_page:"):
+        user_edit_state.pop(query.from_user.id, None)
+        page = int(data.split(":", 1)[1]) if data.startswith("gpb_page:") else 0
+        await show_gate_blacklist(query=query, page=page)
+
+    elif data == "gpb_add":
+        user_edit_state[query.from_user.id] = {"mode": "gate_price_blacklist_add"}
+        await query.message.reply_text(
+            "Введите тикер или несколько через запятую: BTC, ETH, SPACEHOOD. Они добавятся к существующему списку.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="gate_price_blacklist")]]))
+
+    elif data.startswith("gpb_del:"):
+        _, page, name = data.split(":", 2)
+        settings = load_bot_settings()
+        settings["gate_price_blacklist"] = [v for v in settings["gate_price_blacklist"] if v != name]
+        save_bot_settings(settings)
+        await show_gate_blacklist(query=query, page=int(page))
+
+    elif data == "gpb_clear":
+        await query.edit_message_text("Очистить весь blacklist Gate?", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Очистить", callback_data="gpb_clear_confirm")],
+            [InlineKeyboardButton("Отмена", callback_data="gate_price_blacklist")],
+        ]))
+
+    elif data == "gpb_clear_confirm":
+        settings = load_bot_settings()
+        settings["gate_price_blacklist"] = []
+        save_bot_settings(settings)
+        await show_gate_blacklist(query=query)
+
+    elif data in {"gate_price_target", "gate_price_threshold"}:
         user_edit_state[query.from_user.id] = {"mode": data}
         prompts = {
             "gate_price_target": "Без топиков: -1001234567890\nС топиком: -1001234567890 777\nТопик 0 также означает отправку без топика.",
             "gate_price_threshold": "Введите порог отклонения в процентах, например 5 или 2.5. Учитываются отклонения в обе стороны.",
-            "gate_price_blacklist": "Введите полный blacklist через запятую: BTC, ETH_USDT. Для очистки: 0.",
         }
         await query.message.reply_text(prompts[data])
 
@@ -2988,7 +3047,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = state.get("cid")
     text = None
 
-    if state["mode"] in {"gate_price_target", "gate_price_threshold", "gate_price_blacklist"}:
+    if state["mode"] in {"gate_price_target", "gate_price_threshold", "gate_price_blacklist", "gate_price_blacklist_add"}:
         settings = load_bot_settings()
         try:
             if state["mode"] == "gate_price_target":
@@ -3002,8 +3061,14 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError("Порог должен быть от 0.01 до 10000 процентов.")
                 settings["gate_price_threshold_pct"] = float(value)
             else:
-                settings["gate_price_blacklist"] = gate_prices.parse_blacklist(new_input)
+                added = gate_prices.parse_blacklist(new_input)
+                if not added:
+                    raise ValueError("Введите хотя бы один тикер. Очистить список можно кнопкой в меню blacklist.")
+                settings["gate_price_blacklist"] = sorted(set(settings["gate_price_blacklist"]) | set(added))
             save_bot_settings(settings)
+            if state["mode"] in {"gate_price_blacklist", "gate_price_blacklist_add"}:
+                await show_gate_blacklist(message=update.message)
+                return
             text = "Настройки Gate сохранены."
         except ValueError as exc:
             user_edit_state[user_id] = state
