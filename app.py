@@ -2460,6 +2460,7 @@ async def show_gate_price_menu(query):
         "Рост на 10 п.п. · cooldown уведомлений: 3 сек.\n"
         "USDT-контракты · RWA и крипта"
     )
+    text += "\nСвязь: " + escape(gate_prices.HEALTH.get("status", "Ожидание запуска"))
     if gate_prices.HEALTH.get("last_scan"):
         moment = datetime.fromisoformat(gate_prices.HEALTH["last_scan"]).astimezone(ZoneInfo("Europe/Kyiv"))
         text += f"\nПроверено: {moment:%d.%m %H:%M:%S} · {gate_prices.HEALTH['checked']} контрактов"
@@ -2469,6 +2470,7 @@ async def show_gate_price_menu(query):
         [InlineKeyboardButton("ВЫКЛЮЧИТЬ" if settings["gate_price_enabled"] else "ВКЛЮЧИТЬ", callback_data="gate_price_toggle")],
         [InlineKeyboardButton("ЧАТ / ТОПИК", callback_data="gate_price_target")],
         [InlineKeyboardButton("ТЕСТОВОЕ СООБЩЕНИЕ", callback_data="gate_price_test")],
+        [InlineKeyboardButton("ОБНОВИТЬ СТАТУС", callback_data="gate_price_settings")],
         [InlineKeyboardButton("ПОРОГ %", callback_data="gate_price_threshold")],
         [InlineKeyboardButton("BLACKLIST", callback_data="gate_price_blacklist")],
         [InlineKeyboardButton("Назад", callback_data="bot_settings")],

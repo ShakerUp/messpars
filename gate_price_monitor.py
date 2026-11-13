@@ -48,6 +48,10 @@ def parse_blacklist(text):
     return sorted({normalize_contract(v) for v in re.split(r"[,\s]+", text.strip()) if v}) if text.strip() != "0" else []
 
 
+def is_active_contract(contract):
+    return contract.get("status", "trading") in {"trading", "delisting"}
+
+
 def signals(tickers, contracts, threshold, blacklist):
     result = []
     for ticker in tickers:
@@ -55,7 +59,7 @@ def signals(tickers, contracts, threshold, blacklist):
         contract = contracts.get(name)
         if not contract or name in blacklist or not re.fullmatch(r"[A-Z0-9._-]+_USDT", name):
             continue
-        if contract.get("in_delisting") or contract.get("status", "trading") != "trading":
+        if not is_active_contract(contract):
             continue
         last, mark = number(ticker.get("last")), number(ticker.get("mark_price"))
         if last is None or mark is None:
@@ -90,6 +94,7 @@ def alert_text(signal, detected_at):
     leverage, risk = number(metadata.get("leverage_max")), number(metadata.get("risk_limit_max"))
     leverage_text = f"{leverage:g}x" if leverage else "нет данных"
     risk_text = f"{risk:,.0f} USDT".replace(",", " ") if risk else "нет данных"
+    status_text = "\n⚠️ Контракт в процессе делистинга" if metadata.get("in_delisting") or metadata.get("status") == "delisting" else ""
     name = signal["contract"]
     return (
         f'<b>Gate · {signal["deviation"]:+.2f}%</b>\n'
@@ -97,7 +102,7 @@ def alert_text(signal, detected_at):
         f'Цена: <b>{signal["last"]:f}</b>\n'
         f'Справедливая: <b>{signal["mark"]:f}</b>\n'
         f'Макс. плечо: {leverage_text}\n'
-        f'Макс. лимит риска: {risk_text}\n\n'
+        f'Макс. лимит риска: {risk_text}{status_text}\n\n'
         f'Обнаружено: {detected_at} (Киев)'
     )
 
@@ -165,21 +170,25 @@ async def receive_prices(book):
     while True:
         try:
             if not book.enabled:
+                HEALTH["status"] = "Монитор выключен"
                 await asyncio.sleep(0.5)
                 continue
             from websockets.asyncio.client import connect
+            HEALTH["status"] = "Загрузка контрактов"
             rows = await asyncio.to_thread(get_json, BASE_URL + "/contracts")
             if not isinstance(rows, list) or not rows:
                 raise ValueError("Gate contracts unavailable")
-            contracts = {r["name"]: r for r in rows if r.get("status", "trading") == "trading" and not r.get("in_delisting")}
+            contracts = {r["name"]: r for r in rows if is_active_contract(r)}
             if not contracts:
                 raise ValueError("Gate returned no active contracts")
+            HEALTH["status"] = "Подключение WebSocket"
             async with connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=8 * 1024 * 1024) as ws:
                 names = sorted(contracts)
                 for start in range(0, len(names), 100):
                     await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.tickers",
                                               "event": "subscribe", "payload": names[start:start + 100]}))
                 logger.info("[GATE PRICE WS] Подписка: %s контрактов", len(names))
+                HEALTH.update(status="Подписка отправлена, ожидание котировок", subscribed=len(names))
                 quotes = {}
                 connected_at = time.monotonic()
                 while book.enabled and time.monotonic() - connected_at < 900:
@@ -205,13 +214,14 @@ async def receive_prices(book):
                         quotes[name] = {**previous, **row}
                         updated.append(quotes[name])
                     book.update(signals(updated, contracts, book.threshold, set(book.settings.get("gate_price_blacklist", []))), time.time())
-                    HEALTH.update(last_scan=datetime.now(timezone.utc).isoformat(), checked=len(quotes), error=None)
+                    HEALTH.update(last_scan=datetime.now(timezone.utc).isoformat(), checked=len(quotes), error=None, status="WebSocket получает котировки")
                     failures = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             failures += 1
             HEALTH["error"] = str(exc)[:180]
+            HEALTH["status"] = "Переподключение WebSocket"
             logger.exception("[GATE PRICE WS] Переподключение")
             book.latest.clear()
             await asyncio.sleep(min(60, 2 ** min(failures, 5)))

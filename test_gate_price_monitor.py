@@ -24,12 +24,22 @@ class GatePriceTests(unittest.TestCase):
             ("A_USDT", "NaN", "1"), ("B_USDT", "1", "0"), ("C_USDT", "2", "1"),
             ("D_USDT", "2", "1"), ("E_USDT", "Infinity", "1"))]
         contracts = {row["contract"]: self.contract() for row in rows}
-        contracts["D_USDT"]["in_delisting"] = True
+        contracts["D_USDT"].update(in_delisting=True, status="delisted")
         self.assertEqual(monitor.signals(rows, contracts, Decimal(5), ["C_USDT"]), [])
         self.assertEqual(monitor.parse_blacklist("btc, BTCUSDT ETH_USDT"), ["BTC_USDT", "ETH_USDT"])
         self.assertEqual(monitor.parse_blacklist("0"), [])
         with self.assertRaises(ValueError):
             monitor.parse_blacklist("<bad>")
+
+    def test_delisting_contracts_are_scanned_until_delisted(self):
+        contracts = {"AGENCY_USDT": self.contract(status="delisting", in_delisting=True)}
+        rows = [{"contract": "AGENCY_USDT", "last": "0.000076", "mark_price": "0.000061"}]
+        found = monitor.signals(rows, contracts, Decimal(20), [])
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["triggered"])
+        self.assertIn("делистинга", monitor.alert_text(found[0], "now"))
+        contracts["AGENCY_USDT"]["status"] = "delisted"
+        self.assertEqual(monitor.signals(rows, contracts, Decimal(20), []), [])
 
     def test_cooldown_reentry_and_direction_change(self):
         signal = {"triggered": True, "deviation": Decimal(20)}
